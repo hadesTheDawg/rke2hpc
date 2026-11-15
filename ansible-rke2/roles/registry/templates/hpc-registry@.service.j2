@@ -1,0 +1,21 @@
+[Unit]
+Description=HPC container registry (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=hpc-registry
+Group=hpc-registry
+ExecStart=/usr/local/bin/registry serve /etc/hpc-registry/%i.yml
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths={{ hpc_data_root }}/registry
+Environment=OTEL_TRACES_EXPORTER=none
+
+[Install]
+WantedBy=multi-user.target

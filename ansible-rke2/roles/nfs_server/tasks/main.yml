@@ -1,0 +1,39 @@
+---
+# NFS server on the admin node (management network).
+#   hpc_nfs_home_export  home directories, root squashed. Compute nodes mount them
+#                        into pods; add login nodes etc. via hpc_nfs_home_extra_clients.
+#   hpc_nfs_k8s_export   backs the "nfs" StorageClass; cluster nodes only (the
+#                        provisioner needs root).
+- name: Package
+  ansible.builtin.dnf:
+    name: nfs-utils
+    state: present
+
+- name: Export directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: ["{{ hpc_nfs_home_export }}", "{{ hpc_nfs_k8s_export }}"]
+
+- name: Exports
+  ansible.builtin.copy:
+    dest: /etc/exports.d/hpc.exports
+    mode: "0644"
+    content: |
+      # managed by ansible (hpc nfs_server)
+      {{ hpc_nfs_home_export }} {% for c in (hpc_compute_hosts | map('extract', hostvars, 'hpc_mgmt_ip') | list) + hpc_nfs_home_extra_clients %}{{ c }}(rw,sync,root_squash,sec=sys) {% endfor %}
+
+      {{ hpc_nfs_k8s_export }} {% for h in hpc_cluster_hosts %}{{ hostvars[h].hpc_mgmt_ip }}(rw,sync,no_root_squash,sec=sys) {% endfor %}
+
+  register: _exports
+
+- name: nfs-server running
+  ansible.builtin.systemd_service:
+    name: nfs-server
+    enabled: true
+    state: started
+
+- name: Re-export
+  ansible.builtin.command: exportfs -ra
+  when: _exports.changed

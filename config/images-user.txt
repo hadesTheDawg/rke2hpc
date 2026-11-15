@@ -1,0 +1,5 @@
+# Images published in the read-only USER registry (HPC images for tenants).
+# Same format as images-platform.txt.
+docker.io/library/busybox:1.37
+docker.io/library/python:3.13-slim
+docker.io/rockylinux/rockylinux:9

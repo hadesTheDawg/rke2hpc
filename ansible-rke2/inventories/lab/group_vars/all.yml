@@ -1,0 +1,7 @@
+# Lab overrides; everything else is the default in roles/hpc_common/defaults/main.yml.
+hpc_arch: arm64                 # Apple-silicon lab; production is amd64
+hpc_mgmt_iface: bond0           # 10.10.0.0/24
+hpc_pod_iface: hsn0             # 10.20.0.0/24: all pod-to-pod traffic
+# No Ceph in the lab: install the driver anyway to prove every image it needs is
+# in the registry (no StorageClass without hpc_ceph_cluster_id).
+hpc_enable_ceph_csi: true

@@ -1,0 +1,19 @@
+# Pod network: the flannel VXLAN overlay (all pod-to-pod traffic between nodes)
+# runs over {{ hpc_pod_iface_regex or hpc_pod_iface or hpc_mgmt_iface }}. The node IP (API, kubelet, registry) stays on {{ hpc_mgmt_iface }}.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-canal
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    flannel:
+{% if hpc_pod_iface_regex %}
+      regexIface: "{{ hpc_pod_iface_regex }}"
+{% else %}
+      iface: "{{ hpc_pod_iface or hpc_mgmt_iface }}"
+{% endif %}
+{% if hpc_pod_mtu | int > 0 %}
+    calico:
+      vethuMTU: {{ hpc_pod_mtu }}
+{% endif %}

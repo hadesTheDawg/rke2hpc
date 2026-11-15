@@ -1,0 +1,6 @@
+---
+- name: "Certificate {{ cert.name }}"
+  ansible.builtin.command:
+    argv: ["{{ role_path }}/files/issue.sh", "{{ hpc_secrets_dir }}/pki", "{{ cert.name }}", "{{ hpc_cluster_name }}", "{{ cert.sans }}"]
+  register: _issue
+  changed_when: "'issued' in _issue.stdout"

@@ -1,0 +1,29 @@
+# managed by ansible (hpc registry): {{ item.name }}
+version: 0.1
+log:
+  level: info
+storage:
+  filesystem:
+    rootdirectory: {{ hpc_data_root }}/registry/{{ item.store }}
+  delete:
+    enabled: true
+  maintenance:
+    readonly:
+      enabled: {{ item.ro | string | lower }}
+    uploadpurging:
+      enabled: false
+http:
+  addr: {{ item.addr }}
+  secret: {{ hpc_registry_http_secret }}
+  tls:
+    certificate: /etc/hpc-registry/admin.crt
+    key: /etc/hpc-registry/admin.key
+    minimumtls: tls1.2
+  headers:
+    X-Content-Type-Options: [nosniff]
+{% if item.auth %}
+auth:
+  htpasswd:
+    realm: {{ hpc_cluster_name }}-{{ item.name }}
+    path: /etc/hpc-registry/{{ item.auth }}.htpasswd
+{% endif %}

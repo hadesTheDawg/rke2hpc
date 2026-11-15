@@ -1,0 +1,133 @@
+---
+# CNCF distribution, run from the release binary under systemd (no container
+# runtime needed, so it exists before Kubernetes). Each registry is two
+# processes over the same storage:
+#   <name>-ro  network-facing, storage read-only     -> nobody can push over the network
+#   <name>-rw  loopback only, authenticated (push)   -> how the admin node publishes images
+#   system: {{ hpc_sysreg }} TLS + basic auth (account "pull")
+#   user:   {{ hpc_usrreg }} TLS, anonymous pull
+- name: Packages
+  ansible.builtin.dnf:
+    name: [httpd-tools, skopeo, zstd, jq, tar]
+    state: present
+
+- name: Service account
+  ansible.builtin.user:
+    name: hpc-registry
+    system: true
+    home: "{{ hpc_data_root }}/registry"
+    create_home: false
+    shell: /sbin/nologin
+
+- name: Storage
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    owner: hpc-registry
+    group: hpc-registry
+    mode: "0750"
+  loop: ["{{ hpc_data_root }}/registry", "{{ hpc_data_root }}/registry/system", "{{ hpc_data_root }}/registry/user"]
+
+- name: Configuration directory
+  ansible.builtin.file:
+    path: /etc/hpc-registry
+    state: directory
+    group: hpc-registry
+    mode: "0750"
+
+- name: Registry binary
+  ansible.builtin.copy:
+    src: "{{ hpc_data_root }}/bundle/bin/registry"
+    dest: /usr/local/bin/registry
+    remote_src: true
+    mode: "0755"
+  register: _bin
+
+- name: TLS material
+  ansible.builtin.copy:
+    src: "/etc/pki/hpc/{{ item }}"
+    dest: "/etc/hpc-registry/{{ item }}"
+    remote_src: true
+    group: hpc-registry
+    mode: "0640"
+  loop: [admin.crt, admin.key]
+  register: _tls
+
+# bcrypt salts differ on every run, so only rewrite when the password changed.
+- name: Accounts
+  ansible.builtin.shell:
+    cmd: |
+      f=/etc/hpc-registry/{{ item.user }}.htpasswd
+      if [ -f "$f" ] && htpasswd -vb "$f" {{ item.user }} "$PW" >/dev/null 2>&1; then echo current; exit 0; fi
+      htpasswd -Bbn {{ item.user }} "$PW" > "$f.new" && chgrp hpc-registry "$f.new" && chmod 0640 "$f.new" && mv -f "$f.new" "$f"
+      echo updated
+  environment:
+    PW: "{{ item.pw }}"
+  loop:
+    - {user: pull, pw: "{{ hpc_registry_pull_password }}"}
+    - {user: push, pw: "{{ hpc_registry_push_password }}"}
+  loop_control:
+    label: "{{ item.user }}"
+  register: _htpasswd
+  changed_when: "'updated' in _htpasswd.stdout"
+  no_log: true
+
+- name: Instance configuration
+  ansible.builtin.template:
+    src: registry.yml.j2
+    dest: "/etc/hpc-registry/{{ item.name }}.yml"
+    group: hpc-registry
+    mode: "0640"
+  loop:
+    - {name: system-ro, addr: "{{ hpc_admin_ip }}:{{ hpc_registry_system_port }}", store: system, ro: true, auth: pull}
+    - {name: system-rw, addr: "127.0.0.1:{{ hpc_registry_system_rw_port }}", store: system, ro: false, auth: push}
+    - {name: user-ro, addr: "{{ hpc_admin_ip }}:{{ hpc_registry_user_port }}", store: user, ro: true, auth: ""}
+    - {name: user-rw, addr: "127.0.0.1:{{ hpc_registry_user_rw_port }}", store: user, ro: false, auth: push}
+  loop_control:
+    label: "{{ item.name }}"
+  register: _cfg
+
+- name: systemd unit
+  ansible.builtin.template:
+    src: hpc-registry@.service.j2
+    dest: /etc/systemd/system/hpc-registry@.service
+    mode: "0644"
+  register: _unit
+
+- name: Registries running
+  ansible.builtin.systemd_service:
+    name: "hpc-registry@{{ item }}"
+    enabled: true
+    daemon_reload: "{{ _unit.changed }}"
+    state: "{{ 'restarted' if (_bin.changed or _tls.changed or _htpasswd.changed or _cfg.changed or _unit.changed) else 'started' }}"
+  loop: [system-ro, system-rw, user-ro, user-rw]
+
+- name: Registries answer
+  ansible.builtin.uri:
+    url: "{{ item }}/v2/"
+    status_code: [200, 401]
+  loop:
+    - "https://{{ hpc_sysreg }}"
+    - "https://localhost:{{ hpc_registry_system_rw_port }}"
+    - "https://{{ hpc_usrreg }}"
+    - "https://localhost:{{ hpc_registry_user_rw_port }}"
+  register: _up
+  until: _up is succeeded
+  retries: 30
+  delay: 1
+
+- name: Publish the bundle's images
+  ansible.builtin.script:
+    cmd: load-images.sh
+  environment:
+    BUNDLE: "{{ hpc_data_root }}/bundle"
+    PUSH_PASSWORD: "{{ hpc_registry_push_password }}"
+    SYS: "localhost:{{ hpc_registry_system_rw_port }}"
+    USR: "localhost:{{ hpc_registry_user_rw_port }}"
+  register: _load
+  changed_when: "'published 0 new' not in _load.stdout"
+  no_log: false
+
+- name: Image load result
+  ansible.builtin.debug:
+    msg: "{{ _load.stdout_lines | last }}"

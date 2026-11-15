@@ -1,0 +1,5 @@
+# Per-node values. Only needed when a node differs from group_vars.
+ansible_host: 172.16.0.101
+# hpc_mgmt_iface: bond0
+# hpc_pod_iface: hsn1        # this node's HSN port has another name
+# hpc_mgmt_ip: 172.16.0.101  # pin the address instead of reading it from the interface

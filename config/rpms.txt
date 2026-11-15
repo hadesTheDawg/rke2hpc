@@ -1,0 +1,19 @@
+# RPMs (and their full dependency closure) carried into the offline dnf repo.
+# rke2-* come from rpm.rancher.io, the rest from the distro repos.
+rke2-server
+rke2-agent
+rke2-selinux
+container-selinux
+nfs-utils
+nginx
+dnsmasq
+chrony
+skopeo
+zstd
+jq
+tar
+rsync
+httpd-tools
+policycoreutils-python-utils
+bash-completion
+bind-utils

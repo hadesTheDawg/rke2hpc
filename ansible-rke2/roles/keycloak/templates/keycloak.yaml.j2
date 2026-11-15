@@ -1,0 +1,156 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: hpc-local
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: keycloak-db
+spec:
+  capacity: {storage: 10Gi}
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: hpc-local
+  claimRef: {namespace: keycloak, name: data-keycloak-db-0}
+  local: {path: {{ hpc_keycloak_db_dir }}}
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+      - matchExpressions:
+        - {key: kubernetes.io/hostname, operator: In, values: [{{ inventory_hostname }}]}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: keycloak-db, namespace: keycloak}
+spec:
+  clusterIP: None
+  selector: {app: keycloak-db}
+  ports: [{name: postgres, port: 5432}]
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata: {name: keycloak-db, namespace: keycloak}
+spec:
+  serviceName: keycloak-db
+  replicas: 1
+  selector: {matchLabels: {app: keycloak-db}}
+  template:
+    metadata: {labels: {app: keycloak-db}}
+    spec:
+      securityContext: {runAsUser: 999, runAsGroup: 999, fsGroup: 999, runAsNonRoot: true, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: postgres
+        image: {{ hpc_sysreg }}/library/postgres:{{ hpc_postgres_version }}
+        env:
+        - {name: POSTGRES_DB, value: keycloak}
+        - {name: POSTGRES_USER, value: keycloak}
+        - {name: POSTGRES_PASSWORD, valueFrom: {secretKeyRef: {name: keycloak-credentials, key: db-password}}}
+        - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+        ports: [{name: postgres, containerPort: 5432}]
+        readinessProbe:
+          exec: {command: [pg_isready, -U, keycloak, -d, keycloak]}
+          periodSeconds: 5
+        resources:
+          requests: {cpu: 100m, memory: 256Mi}
+          limits: {memory: 1Gi}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts: [{name: data, mountPath: /var/lib/postgresql/data}]
+  volumeClaimTemplates:
+  - metadata: {name: data}
+    spec:
+      accessModes: [ReadWriteOnce]
+      storageClassName: hpc-local
+      resources: {requests: {storage: 10Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  selector: {app: keycloak}
+  ports: [{name: http, port: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  replicas: 1
+  strategy: {type: Recreate}
+  selector: {matchLabels: {app: keycloak}}
+  template:
+    metadata: {labels: {app: keycloak}}
+    spec:
+      securityContext: {runAsNonRoot: true, runAsUser: 1000, seccompProfile: {type: RuntimeDefault}}
+      containers:
+      - name: keycloak
+        image: {{ hpc_sysreg }}/keycloak/keycloak:{{ hpc_keycloak_version }}
+        args:
+        - start
+        - --hostname=https://{{ hpc_keycloak_host }}
+        - --http-enabled=true
+        - --proxy-headers=xforwarded
+        - --health-enabled=true
+        - --db=postgres
+        - --db-url=jdbc:postgresql://keycloak-db.keycloak.svc:5432/keycloak
+        - --db-username=keycloak
+        - --truststore-paths=/etc/hpc-ca/ca.crt
+        env:
+        - {name: KC_DB_PASSWORD, valueFrom: {secretKeyRef: {name: keycloak-credentials, key: db-password}}}
+        - {name: KC_BOOTSTRAP_ADMIN_USERNAME, value: admin}
+        - {name: KC_BOOTSTRAP_ADMIN_PASSWORD, valueFrom: {secretKeyRef: {name: keycloak-credentials, key: admin-password}}}
+        ports:
+        - {name: http, containerPort: 8080}
+        - {name: management, containerPort: 9000}
+        startupProbe:
+          httpGet: {path: /health/started, port: management}
+          periodSeconds: 5
+          failureThreshold: 120
+        readinessProbe:
+          httpGet: {path: /health/ready, port: management}
+          periodSeconds: 10
+        livenessProbe:
+          httpGet: {path: /health/live, port: management}
+          periodSeconds: 20
+        resources:
+          requests: {cpu: 500m, memory: 1Gi}
+          limits: {memory: 2Gi}
+        securityContext: {allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+        volumeMounts: [{name: hpc-ca, mountPath: /etc/hpc-ca, readOnly: true}]
+      volumes:
+      - {name: hpc-ca, configMap: {name: hpc-ca}}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  ingressClassName: traefik
+  tls: [{hosts: [{{ hpc_keycloak_host }}], secretName: keycloak-tls}]
+  rules:
+  - host: {{ hpc_keycloak_host }}
+    http:
+      paths:
+      - {path: /, pathType: Prefix, backend: {service: {name: keycloak, port: {number: 8080}}}}
+---
+# Only the ingress controller may reach Keycloak; only Keycloak may reach its database.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: keycloak, namespace: keycloak}
+spec:
+  podSelector: {matchLabels: {app: keycloak}}
+  policyTypes: [Ingress]
+  ingress:
+  - from:
+    - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+    ports: [{port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: keycloak-db, namespace: keycloak}
+spec:
+  podSelector: {matchLabels: {app: keycloak-db}}
+  policyTypes: [Ingress]
+  ingress:
+  - from: [{podSelector: {matchLabels: {app: keycloak}}}]
+    ports: [{port: 5432}]

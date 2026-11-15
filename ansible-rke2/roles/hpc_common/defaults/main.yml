@@ -1,0 +1,234 @@
+# Every setting of the deployment, with its default. Every role depends on this
+# role, so these are visible everywhere. Override any of them in your
+# inventory (group_vars/all.yml, or host_vars/<host>.yml for per-node values).
+# docs/variables.md describes them in more detail.
+
+# =============================================================================
+# Inventory layout
+# =============================================================================
+# Group names are fixed: rke2_servers (exactly one host: the admin node) and
+# rke2_agents (compute nodes). Optional: rpm_fetch (an internet-connected EL
+# host of the target arch that resolves the offline RPM repository).
+hpc_admin_host: "{{ groups['rke2_servers'][0] }}"
+hpc_compute_hosts: "{{ groups['rke2_agents'] | default([]) }}"
+hpc_cluster_hosts: "{{ [hpc_admin_host] + hpc_compute_hosts }}"
+hpc_rpm_fetch_host: "{{ (groups['rpm_fetch'] | default([]))[0] | default('') }}"
+
+# Where generated state lives on the machine running ansible (your laptop).
+# Default: next to the inventory, so each site keeps its own CA and passwords.
+hpc_site_dir: "{{ hostvars[hpc_admin_host].inventory_dir }}"
+hpc_secrets_dir: "{{ hpc_site_dir }}/secrets"          # CA, certificates, passwords (keep it safe, back it up)
+hpc_projects_file: "{{ hpc_site_dir }}/projects.txt"   # the flat file
+hpc_bundle_dir: "{{ playbook_dir }}/.bundle/{{ hpc_arch }}"   # download cache, shared by sites of one arch
+
+# =============================================================================
+# Components (each one is a role; switch off what the site provides itself)
+# =============================================================================
+hpc_enable_bundle: true        # download + push the offline bundle
+hpc_enable_base: true          # /etc/hosts, CA trust, repo, time, DNS
+hpc_enable_registry: true      # the two registries on the admin node
+hpc_enable_nfs_server: true    # NFS exports on the admin node (homes + default StorageClass)
+hpc_enable_rke2: true
+hpc_enable_platform: true      # ingress TLS, platform namespaces, default StorageClass
+hpc_enable_ceph_csi: false     # CephFS CSI driver (images are always in the registry; see docs/ceph.md)
+hpc_enable_keycloak: true
+hpc_enable_rancher: true
+hpc_enable_identity: true      # Keycloak realm/clients, Rancher login
+hpc_enable_tenants: true       # the flat file
+hpc_enable_accounting: true    # job accounting (measures only)
+
+# =============================================================================
+# Site identity and platform
+# =============================================================================
+hpc_cluster_name: hpc
+hpc_domain: hpc.internal
+hpc_arch: amd64                # amd64 | arm64
+hpc_rpm_arch: "{{ {'amd64': 'x86_64', 'arm64': 'aarch64'}[hpc_arch] }}"
+hpc_el_major: 9
+
+# =============================================================================
+# Networks
+# =============================================================================
+# Management network: ssh from the deployer, Kubernetes API, kubelet, registry,
+# NFS, DNS. The node IP Kubernetes uses is the address on this interface.
+hpc_mgmt_iface: bond0
+# Pod network: interface the pod overlay (flannel VXLAN in canal) runs over,
+# i.e. all pod-to-pod traffic between nodes. Empty = same as management.
+hpc_pod_iface: hsn0
+# Set either per host (host_vars) when names or addresses differ between nodes.
+hpc_mgmt_ip: "{{ ansible_facts[hpc_mgmt_iface | replace('-', '_')]['ipv4']['address'] }}"
+hpc_pod_ip: "{{ ansible_facts[(hpc_pod_iface or hpc_mgmt_iface) | replace('-', '_')]['ipv4']['address'] }}"
+# Subnets of those networks (default: read from the admin node's interfaces).
+hpc_mgmt_cidr: "{{ _hpc_admin_facts[hpc_mgmt_iface | replace('-', '_')]['ipv4']['network'] }}/{{ _hpc_admin_facts[hpc_mgmt_iface | replace('-', '_')]['ipv4']['prefix'] }}"
+hpc_pod_net_cidr: "{{ (_hpc_admin_facts[hpc_pod_iface | replace('-', '_')]['ipv4']['network'] ~ '/' ~ _hpc_admin_facts[hpc_pod_iface | replace('-', '_')]['ipv4']['prefix']) if hpc_pod_iface else '' }}"
+# Node networks project pods may not open connections to (except the admin
+# node's API, ingress and user registry). Add storage / BMC networks here.
+hpc_node_cidrs: "{{ [hpc_mgmt_cidr, hpc_pod_net_cidr] | select | unique | list }}"
+# Interface names that differ between nodes (hsn0 on some, hsn1 on others):
+# a regular expression instead, e.g. "^hsn[0-9]+$" (wins over hpc_pod_iface).
+hpc_pod_iface_regex: ""
+# MTU of pod interfaces. 0 = chart default (1450). On a 9000-byte HSN use 8950
+# (interface MTU minus 50 for the VXLAN header).
+hpc_pod_mtu: 0
+hpc_cluster_cidr: 10.42.0.0/16 # pod addresses; must not overlap any node network
+hpc_service_cidr: 10.43.0.0/16
+_hpc_admin_facts: "{{ hostvars[hpc_admin_host]['ansible_facts'] }}"
+hpc_admin_ip: "{{ hostvars[hpc_admin_host]['hpc_mgmt_ip'] }}"
+
+# =============================================================================
+# Versions (bump, then re-run bundle.yml + site.yml)
+# =============================================================================
+hpc_rke2_version: v1.36.6+rke2r1
+hpc_rke2_cni: canal            # canal enforces NetworkPolicy; pod iface support is wired for canal
+hpc_rancher_version: 2.15.3
+hpc_keycloak_version: 26.8.2
+hpc_postgres_version: "17.6"
+hpc_registry_version: 3.1.2    # CNCF distribution
+hpc_helm_version: v4.3.2
+hpc_kubelogin_version: v1.36.4
+hpc_nfs_provisioner_chart_version: 4.0.18
+hpc_nfs_provisioner_image_tag: v4.0.2
+hpc_ceph_csi_chart_version: 3.18.2
+
+# =============================================================================
+# Service names (all resolve to the admin node's management address)
+# =============================================================================
+hpc_registry_system_host: "registry.{{ hpc_domain }}"   # RKE2/platform images, authenticated
+hpc_registry_system_port: 5000
+hpc_registry_system_rw_port: 5010                       # push endpoint, loopback on the admin node
+hpc_registry_user_host: "hub.{{ hpc_domain }}"          # user images, anonymous, read-only
+hpc_registry_user_port: 5001
+hpc_registry_user_rw_port: 5011
+hpc_repo_port: 8443                                     # offline dnf repo (nginx, TLS)
+hpc_kube_api_host: "kube.{{ hpc_domain }}"
+hpc_rancher_host: "rancher.{{ hpc_domain }}"
+hpc_keycloak_host: "keycloak.{{ hpc_domain }}"
+hpc_apps_domain: "apps.{{ hpc_domain }}"                # tenant ingress: <app>.<namespace>.<apps domain>
+hpc_kubectl: /var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml
+hpc_helm: /usr/local/bin/helm
+hpc_sysreg: "{{ hpc_registry_system_host }}:{{ hpc_registry_system_port }}"
+hpc_usrreg: "{{ hpc_registry_user_host }}:{{ hpc_registry_user_port }}"
+
+# =============================================================================
+# Node baseline
+# =============================================================================
+hpc_offline: true              # nodes have no internet: distro repos are disabled, packages come from the bundle
+hpc_offline_repo: true         # serve the bundle's RPMs from the admin node (false: nodes use their own repos)
+hpc_manage_hosts_file: true    # managed block in /etc/hosts with nodes + service names
+hpc_extra_hosts: []            # more "<ip> <name> ..." lines for that block
+hpc_manage_dns: true           # dnsmasq on the admin node answers for {{ hpc_domain }}
+hpc_coredns_forward_domain: true  # cluster DNS forwards {{ hpc_domain }} to the admin node (node resolvers untouched)
+hpc_manage_time: true          # admin node serves time (chrony); other nodes follow it
+hpc_ntp_servers: []            # upstream NTP for the admin node, if the site has one
+
+# =============================================================================
+# Storage
+# =============================================================================
+hpc_data_root: /srv/hpc        # admin node: bundle, registries, repo
+hpc_home_root: /c/home         # home directories are <home root>/<user> (inside pods too)
+hpc_nfs_home_export: /c/home   # exported from the admin node (when hpc_enable_nfs_server)
+hpc_nfs_k8s_export: /c/k8s     # backs the NFS StorageClass
+hpc_nfs_home_extra_clients: [] # more addresses/CIDRs allowed to mount the homes (e.g. login nodes)
+# Home directory mounted into every project pod: nfs | none
+hpc_home_volume: nfs
+hpc_home_nfs_server: "{{ hpc_admin_ip }}"
+hpc_home_nfs_path: "{{ hpc_nfs_home_export }}"
+# Directory where hpc-sync creates new homes on the admin node ('' = homes are made elsewhere)
+hpc_home_create_root: "{{ hpc_nfs_home_export if hpc_enable_nfs_server else '' }}"
+# Default StorageClass for volume claims: nfs | cephfs | none
+hpc_storage_backend: nfs
+hpc_storage_class: "{{ {'nfs': 'nfs', 'cephfs': hpc_ceph_storage_class, 'none': ''}[hpc_storage_backend] }}"
+
+# ---- CephFS (docs/ceph.md) ---------------------------------------------------
+hpc_ceph_namespace: ceph-csi-cephfs
+hpc_ceph_cluster_id: ""        # ceph fsid
+hpc_ceph_monitors: []          # ["10.30.0.1:6789", ...]
+hpc_ceph_fs_name: cephfs
+hpc_ceph_subvolume_group: csi
+hpc_ceph_user_id: ""           # e.g. "k8s" (client.k8s), needs the CSI caps
+hpc_ceph_user_key: ""          # its key; keep it in an ansible-vault file
+hpc_ceph_storage_class: cephfs
+hpc_ceph_kernel_mount_options: ""
+hpc_ceph_provisioner_replicas: 1
+hpc_ceph_nodeplugin_metrics_port: 9481   # host port on every node (8081 is canal's)
+
+# =============================================================================
+# Identity and tenancy
+# =============================================================================
+hpc_keycloak_realm: hpc
+hpc_uid_start: 5001
+hpc_gid_start: 6001
+hpc_platform_admin_group: hpc-admins       # Keycloak group -> cluster-admin + Rancher admin
+hpc_platform_admin_users: [opsadmin]       # Keycloak-only accounts
+hpc_oidc_group_prefix: "oidc:"
+hpc_keycloak_allow_password_grant: true    # needed by verify.yml; review for production
+hpc_initial_passwords_temporary: false
+hpc_upstream_oidc_issuer: ""
+hpc_upstream_oidc_client_id: ""
+hpc_upstream_oidc_alias: upstream
+hpc_upstream_oidc_spoof: false
+hpc_tenant_pod_security: baseline
+hpc_tenant_default_cpu_request: 500m
+hpc_tenant_default_cpu_limit: "1"
+hpc_tenant_default_mem_request: 512Mi
+hpc_tenant_default_mem_limit: 1Gi
+hpc_tenant_default_cpu_hours: 1000         # allocation when the flat file gives none / has no CPU_HOURS column
+hpc_platform_namespaces: [hpc-storage, keycloak, cattle-system, cattle-fleet-system, cattle-fleet-local-system]
+# not pinned: cluster-wide services, and the CSI node plugin (runs on every node)
+hpc_unpinned_namespaces: "{{ ['kube-system', 'kube-public', 'kube-node-lease', 'default', hpc_ceph_namespace] }}"
+
+# =============================================================================
+# Accounting
+# =============================================================================
+hpc_acct_period_start: "10-01"
+hpc_acct_poll_seconds: 5
+
+# =============================================================================
+# Generated credentials (created on first use under hpc_secrets_dir)
+# =============================================================================
+hpc_secret_chars: [ascii_letters, digits]
+hpc_registry_pull_password: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/registry-pull', length=32, chars=hpc_secret_chars) }}"
+hpc_registry_push_password: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/registry-push', length=32, chars=hpc_secret_chars) }}"
+hpc_registry_http_secret: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/registry-http-secret', length=32, chars=hpc_secret_chars) }}"
+hpc_rke2_server_token: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/rke2-server-token', length=32, chars=hpc_secret_chars) }}"
+hpc_rke2_agent_token: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/rke2-agent-token', length=32, chars=hpc_secret_chars) }}"
+hpc_keycloak_admin_password: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/keycloak-admin', length=32, chars=hpc_secret_chars) }}"
+hpc_keycloak_db_password: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/keycloak-db', length=32, chars=hpc_secret_chars) }}"
+hpc_rancher_admin_password: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/rancher-admin', length=32, chars=hpc_secret_chars) }}"
+hpc_rancher_oidc_secret: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/rancher-oidc-client', length=32, chars=hpc_secret_chars) }}"
+hpc_upstream_oidc_secret: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/upstream-oidc-client', length=32, chars=hpc_secret_chars) }}"
+
+# Settings handed to hpc-sync (identity + tenants) on the admin node.
+hpc_sync_env:
+  CLUSTER_NAME: "{{ hpc_cluster_name }}"
+  CLUSTER_DOMAIN: "{{ hpc_domain }}"
+  KEYCLOAK_REALM: "{{ hpc_keycloak_realm }}"
+  KEYCLOAK_HOST: "{{ hpc_keycloak_host }}"
+  RANCHER_HOST: "{{ hpc_rancher_host }}"
+  APPS_DOMAIN: "{{ hpc_apps_domain }}"
+  OIDC_GROUP_PREFIX: "{{ hpc_oidc_group_prefix }}"
+  PLATFORM_ADMIN_GROUP: "{{ hpc_platform_admin_group }}"
+  PLATFORM_ADMIN_USERS: "{{ hpc_platform_admin_users | join(' ') }}"
+  KEYCLOAK_ALLOW_PASSWORD_GRANT: "{{ hpc_keycloak_allow_password_grant | string | lower }}"
+  INITIAL_PASSWORDS_TEMPORARY: "{{ hpc_initial_passwords_temporary | string | lower }}"
+  UPSTREAM_OIDC_ISSUER: "{{ hpc_upstream_oidc_issuer }}"
+  UPSTREAM_OIDC_CLIENT_ID: "{{ hpc_upstream_oidc_client_id }}"
+  UPSTREAM_OIDC_ALIAS: "{{ hpc_upstream_oidc_alias }}"
+  UPSTREAM_OIDC_SPOOF: "{{ hpc_upstream_oidc_spoof | string | lower }}"
+  UID_START: "{{ hpc_uid_start }}"
+  GID_START: "{{ hpc_gid_start }}"
+  TENANT_POD_SECURITY: "{{ hpc_tenant_pod_security }}"
+  TENANT_DEFAULT_CPU_REQUEST: "{{ hpc_tenant_default_cpu_request }}"
+  TENANT_DEFAULT_CPU_LIMIT: "{{ hpc_tenant_default_cpu_limit }}"
+  TENANT_DEFAULT_MEM_REQUEST: "{{ hpc_tenant_default_mem_request }}"
+  TENANT_DEFAULT_MEM_LIMIT: "{{ hpc_tenant_default_mem_limit }}"
+  TENANT_DEFAULT_CPU_HOURS: "{{ hpc_tenant_default_cpu_hours }}"
+  ADMIN_IP: "{{ hpc_admin_ip }}"
+  NODE_CIDRS: "{{ hpc_node_cidrs | join(' ') }}"
+  POD_CIDR: "{{ hpc_cluster_cidr }}"
+  REGISTRY_USER_PORT: "{{ hpc_registry_user_port }}"
+  HOME_ROOT: "{{ hpc_home_root }}"
+  HOME_VOLUME: "{{ hpc_home_volume }}"
+  HOME_NFS_SERVER: "{{ hpc_home_nfs_server }}"
+  HOME_NFS_PATH: "{{ hpc_home_nfs_path }}"
+  HOME_CREATE_ROOT: "{{ hpc_home_create_root }}"

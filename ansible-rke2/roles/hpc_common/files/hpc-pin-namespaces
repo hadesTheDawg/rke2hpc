@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# hpc-pin-namespaces <admin-node> "<unpinned namespaces>"
+# Pin every non-project namespace to the admin node (PodNodeSelector) and move
+# pods that started elsewhere before the pin existed. Safe to run any time.
+set -euo pipefail
+admin="$1" unpinned=" $2 "
+K="/var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml"
+for ns in $($K get ns -l 'hpc.io/tenant!=true' -o jsonpath='{.items[*].metadata.name}'); do
+  case "$unpinned" in *" $ns "*) continue ;; esac
+  $K annotate namespace "$ns" --overwrite scheduler.alpha.kubernetes.io/node-selector=hpc.io/role=admin >/dev/null
+  $K label namespace "$ns" --overwrite hpc.io/platform=true >/dev/null
+  pods=$($K get pods -n "$ns" --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[*]}{.metadata.name} {.spec.nodeName}{"\n"}{end}' | awk -v a="$admin" '$2!=a {print $1}')
+  if [ -n "$pods" ]; then
+    echo "moving pods in $ns to the admin node: $(echo $pods)"
+    $K delete pod -n "$ns" $pods --wait=false >/dev/null
+  fi
+done

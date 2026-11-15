@@ -1,0 +1,74 @@
+---
+# Cluster plumbing shared by the platform services. Runs on the admin node.
+- name: Admin tools
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: admin-tools
+
+- name: Ingress certificate
+  ansible.builtin.copy:
+    src: "{{ hpc_secrets_dir }}/pki/{{ item.f }}"
+    dest: "/etc/pki/hpc/{{ item.f }}"
+    mode: "{{ item.m }}"
+  loop: [{f: ingress.crt, m: "0644"}, {f: ingress.key, m: "0600"}]
+
+- name: Platform namespaces
+  ansible.builtin.shell:
+    cmd: "{{ hpc_kubectl }} create namespace {{ item }} --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -"
+  loop: "{{ hpc_platform_namespaces }}"
+  register: _ns
+  changed_when: "'created' in _ns.stdout"
+
+- name: Pin platform namespaces
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: pin-namespaces
+
+- name: Site certificate as the ingress default
+  ansible.builtin.shell:
+    cmd: >-
+      {{ hpc_kubectl }} -n kube-system create secret tls hpc-ingress-tls
+      --cert=/etc/pki/hpc/ingress.crt --key=/etc/pki/hpc/ingress.key --dry-run=client -o yaml
+      | {{ hpc_kubectl }} apply -f -
+  register: _sec
+  changed_when: "'configured' in _sec.stdout or 'created' in _sec.stdout"
+
+- name: Traefik CRDs present
+  ansible.builtin.command: "{{ hpc_kubectl }} get crd tlsstores.traefik.io"
+  register: _crd
+  until: _crd.rc == 0
+  retries: 60
+  delay: 5
+  changed_when: false
+
+- name: Traefik TLS store
+  ansible.builtin.command: /usr/local/libexec/hpc/hpc-apply-tlsstore
+  register: _tls
+  changed_when: "'unchanged' not in _tls.stdout"
+
+# Volumes land in <export>/<namespace>/<claim>. NFS does not enforce sizes; the
+# project ResourceQuota (requests.storage) limits what can be requested.
+- name: NFS StorageClass
+  when: hpc_enable_nfs_server | bool
+  ansible.builtin.shell:
+    cmd: |
+      {{ hpc_helm }} upgrade --install nfs-provisioner \
+        {{ hpc_data_root }}/bundle/charts/nfs-subdir-external-provisioner-{{ hpc_nfs_provisioner_chart_version }}.tgz \
+        --namespace hpc-storage --wait --timeout 5m -f - <<'YAML'
+      image:
+        repository: {{ hpc_sysreg }}/sig-storage/nfs-subdir-external-provisioner
+        tag: {{ hpc_nfs_provisioner_image_tag }}
+      nfs:
+        server: {{ hpc_admin_ip }}
+        path: {{ hpc_nfs_k8s_export }}
+      storageClass:
+        name: nfs
+        defaultClass: {{ (hpc_storage_backend == 'nfs') | string | lower }}
+        archiveOnDelete: true
+        pathPattern: "${.PVC.namespace}/${.PVC.name}"
+        accessModes: ReadWriteMany
+      YAML
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+    PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+  changed_when: true

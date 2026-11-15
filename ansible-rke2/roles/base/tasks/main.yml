@@ -1,0 +1,115 @@
+---
+# Node baseline. The admin node runs first (separate play): it hosts the
+# package repository every other node installs from.
+- name: Certificate directory
+  ansible.builtin.file:
+    path: /etc/pki/hpc
+    state: directory
+    mode: "0755"
+  when: inventory_hostname == hpc_admin_host
+
+- name: Admin node certificates
+  ansible.builtin.copy:
+    src: "{{ hpc_secrets_dir }}/pki/{{ item.f }}"
+    dest: "/etc/pki/hpc/{{ item.f }}"
+    mode: "{{ item.m }}"
+  loop: [{f: ca.crt, m: "0644"}, {f: admin.crt, m: "0644"}, {f: admin.key, m: "0600"}]
+  when: inventory_hostname == hpc_admin_host
+
+# ---- name resolution: managed block in /etc/hosts ---------------------------
+- name: Cluster names in /etc/hosts
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} hpc managed"
+    block: |
+      {% for h in hpc_cluster_hosts %}
+      {{ hostvars[h].hpc_mgmt_ip }} {{ h }}.{{ hpc_domain }} {{ h }}
+      {% endfor %}
+      {{ hpc_admin_ip }} {{ hpc_registry_system_host }} {{ hpc_registry_user_host }} {{ hpc_kube_api_host }} {{ hpc_rancher_host }} {{ hpc_keycloak_host }}
+      {% for l in hpc_extra_hosts %}
+      {{ l }}
+      {% endfor %}
+  when: hpc_manage_hosts_file | bool
+
+# ---- trust the site CA ---------------------------------------------------------
+- name: Site CA in the trust store
+  ansible.builtin.copy:
+    src: "{{ hpc_secrets_dir }}/pki/ca.crt"
+    dest: /etc/pki/ca-trust/source/anchors/hpc-ca.crt
+    mode: "0644"
+  register: _ca
+
+- name: Update the trust store
+  ansible.builtin.command: update-ca-trust extract
+  when: _ca.changed
+
+# ---- package repository ----------------------------------------------------------
+- name: Offline repository
+  when: hpc_offline_repo | bool
+  vars:
+    _repo_url: "{{ ('file://' ~ hpc_data_root ~ '/bundle/rpms') if inventory_hostname == hpc_admin_host
+                   else ('https://' ~ hpc_admin_host ~ '.' ~ hpc_domain ~ ':' ~ hpc_repo_port ~ '/repo') }}"
+  block:
+    - name: Bundle is on the admin node
+      ansible.builtin.stat:
+        path: "{{ hpc_data_root }}/bundle/rpms/repodata/repomd.xml"
+      register: _repomd
+      when: inventory_hostname == hpc_admin_host
+    - name: Bundle is present
+      ansible.builtin.assert:
+        that: _repomd.stat.exists
+        fail_msg: "no RPM repository in {{ hpc_data_root }}/bundle (run the bundle role first)"
+      when: inventory_hostname == hpc_admin_host
+    - name: Repository definition
+      ansible.builtin.copy:
+        dest: /etc/yum.repos.d/hpc-offline.repo
+        mode: "0644"
+        content: |
+          [hpc-offline]
+          name=HPC offline repository (admin node)
+          baseurl={{ _repo_url }}
+          enabled=1
+          gpgcheck=1
+          gpgkey={{ _repo_url }}/RPM-GPG-KEY-distro {{ _repo_url }}/RPM-GPG-KEY-rancher
+          metadata_expire=60
+
+- name: Disable distro repositories (no route to the internet)
+  ansible.builtin.shell:
+    cmd: |
+      for f in /etc/yum.repos.d/*.repo; do
+        [ "$f" = /etc/yum.repos.d/hpc-offline.repo ] && continue
+        if grep -q '^enabled=1' "$f"; then sed -i 's/^enabled=1/enabled=0/' "$f"; echo "disabled $f"; fi
+      done
+  register: _disable
+  changed_when: _disable.stdout | length > 0
+  when: hpc_offline | bool and hpc_offline_repo | bool
+
+- name: Admin node services
+  ansible.builtin.include_tasks: admin.yml
+  when: inventory_hostname == hpc_admin_host
+
+# ---- time ---------------------------------------------------------------------------
+- name: Follow the admin node's clock
+  when: hpc_manage_time | bool and inventory_hostname != hpc_admin_host
+  block:
+    - name: chrony
+      ansible.builtin.dnf:
+        name: chrony
+        state: present
+    - name: chrony.conf
+      ansible.builtin.copy:
+        dest: /etc/chrony.conf
+        mode: "0644"
+        content: |
+          # managed by ansible (hpc base)
+          server {{ hpc_admin_host }}.{{ hpc_domain }} iburst
+          driftfile /var/lib/chrony/drift
+          makestep 1.0 3
+          rtcsync
+          logdir /var/log/chrony
+      register: _chrony
+    - name: chronyd running
+      ansible.builtin.systemd_service:
+        name: chronyd
+        enabled: true
+        state: "{{ 'restarted' if _chrony.changed else 'started' }}"

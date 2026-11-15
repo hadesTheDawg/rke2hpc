@@ -1,0 +1,102 @@
+---
+# Rancher from the bundled chart; every image from the system registry.
+- name: Admin tools
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: admin-tools
+
+- name: TLS secrets
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      k="{{ hpc_kubectl }} -n cattle-system"
+      $k create secret tls tls-rancher-ingress --cert=/etc/pki/hpc/ingress.crt --key=/etc/pki/hpc/ingress.key \
+        --dry-run=client -o yaml | $k apply -f -
+      $k create secret generic tls-ca --from-file=cacerts.pem=/etc/pki/hpc/ca.crt --dry-run=client -o yaml | $k apply -f -
+  register: _rsec
+  changed_when: "'configured' in _rsec.stdout or 'created' in _rsec.stdout"
+
+- name: Chart values
+  ansible.builtin.copy:
+    dest: /etc/hpc/rancher-values.yaml
+    mode: "0600"
+    content: |
+      hostname: {{ hpc_rancher_host }}
+      replicas: 1
+      bootstrapPassword: "{{ hpc_rancher_admin_password }}"
+      privateCA: true
+      ingress:
+        ingressClassName: traefik
+        tls:
+          source: secret
+      systemDefaultRegistry: {{ hpc_sysreg }}
+      rancherImage: {{ hpc_sysreg }}/rancher/rancher
+      useBundledSystemChart: true
+  no_log: true
+
+- name: Rancher
+  ansible.builtin.command: >-
+    {{ hpc_helm }} upgrade --install rancher {{ hpc_data_root }}/bundle/charts/rancher-{{ hpc_rancher_version }}.tgz
+    --namespace cattle-system --wait --timeout 15m -f /etc/hpc/rancher-values.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  changed_when: true
+
+- name: Rollout
+  ansible.builtin.command: "{{ hpc_kubectl }} -n cattle-system rollout status deployment/rancher --timeout=900s"
+  changed_when: false
+
+# The deployment owns the admin password (secrets/rancher-admin): skip the
+# interactive first-login steps.
+- name: Rancher admin user exists
+  ansible.builtin.command: >-
+    {{ hpc_kubectl }} get users.management.cattle.io
+    -l authz.management.cattle.io/bootstrapping=admin-user -o name
+  register: _admin
+  until: _admin.stdout | length > 0
+  retries: 60
+  delay: 5
+  changed_when: false
+
+- name: First-login settings
+  ansible.builtin.shell:
+    cmd: |
+      {{ hpc_kubectl }} patch {{ _admin.stdout_lines[0] }} --type merge -p '{"mustChangePassword":false}'
+      {{ hpc_kubectl }} patch settings.management.cattle.io first-login --type merge -p '{"value":"false"}' || true
+      {{ hpc_kubectl }} patch settings.management.cattle.io server-url --type merge -p '{"value":"https://{{ hpc_rancher_host }}"}'
+  register: _patch
+  changed_when: "'patched' in _patch.stdout and 'no change' not in _patch.stdout"
+
+- name: Rancher answers through the ingress
+  ansible.builtin.uri:
+    url: "https://{{ hpc_rancher_host }}/ping"
+  register: _ping
+  until: _ping is succeeded
+  retries: 60
+  delay: 5
+
+# Rancher installs its own components (webhook, fleet, cluster-api, ...)
+# through helm jobs after it starts. Wait for them, then pin their namespaces.
+- name: Rancher components settled
+  ansible.builtin.shell:
+    cmd: |
+      calm=0
+      for _ in $(seq 120); do
+        if ! {{ hpc_kubectl }} get pods -n cattle-system --no-headers 2>/dev/null | grep -E '^helm-operation' | grep -qE 'Running|Pending|ContainerCreating|Init' \
+           && {{ hpc_kubectl }} get deployment -n cattle-system rancher-webhook >/dev/null 2>&1; then calm=$((calm+1)); else calm=0; fi
+        [ "$calm" -ge 6 ] && exit 0
+        sleep 5
+      done
+      echo "Rancher is still installing components; re-run to pin them"
+  register: _settle
+  changed_when: false
+
+- name: Settle result
+  ansible.builtin.debug:
+    msg: "{{ _settle.stdout }}"
+  when: _settle.stdout | length > 0
+
+- name: Pin Rancher's namespaces
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: pin-namespaces

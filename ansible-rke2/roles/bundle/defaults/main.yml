@@ -1,0 +1,72 @@
+# What goes into the offline bundle. Override these lists in your inventory to
+# add images or packages; the registry role publishes whatever is listed.
+
+# SYSTEM registry: platform images besides the RKE2 release tarballs. The
+# registry host is stripped: docker.io/rancher/rancher:v2 lands at <sysreg>/rancher/rancher:v2.
+hpc_images_system:
+  - "docker.io/rancher/rancher:v{{ hpc_rancher_version }}"
+  - "docker.io/rancher/rancher-agent:v{{ hpc_rancher_version }}"
+  - docker.io/rancher/rancher-webhook:v0.11.4
+  - docker.io/rancher/fleet:v0.16.3
+  - docker.io/rancher/fleet-agent:v0.16.3
+  - docker.io/rancher/shell:v0.8.3
+  - docker.io/rancher/kuberlr-kubectl:v8.1.2
+  - docker.io/rancher/system-upgrade-controller:v0.20.1
+  - docker.io/rancher/remotedialer-proxy:v0.8.3
+  - docker.io/rancher/cluster-api-controller:v1.13.3
+  - docker.io/rancher/turtles:v0.27.4
+  - "quay.io/keycloak/keycloak:{{ hpc_keycloak_version }}"
+  - "docker.io/library/postgres:{{ hpc_postgres_version }}"
+  - "registry.k8s.io/sig-storage/nfs-subdir-external-provisioner:{{ hpc_nfs_provisioner_image_tag }}"
+
+# Everything the ceph-csi-cephfs chart (hpc_ceph_csi_chart_version) runs.
+# Always bundled, so CephFS can be switched on later without a new bundle.
+hpc_bundle_ceph: true
+hpc_images_ceph:
+  - "quay.io/cephcsi/cephcsi:v{{ hpc_ceph_csi_chart_version }}"
+  - registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
+  - registry.k8s.io/sig-storage/csi-provisioner:v6.3.0
+  - registry.k8s.io/sig-storage/csi-attacher:v4.13.0
+  - registry.k8s.io/sig-storage/csi-resizer:v2.2.1
+  - registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0
+
+# USER registry: images published read-only for projects.
+hpc_images_user:
+  - docker.io/library/busybox:1.37
+  - docker.io/library/python:3.13-slim
+  - docker.io/rockylinux/rockylinux:9
+
+# RPMs (with full dependency closure) for the offline repo; rke2-* come from rpm.rancher.io.
+hpc_rpms:
+  - rke2-server
+  - rke2-agent
+  - rke2-selinux
+  - container-selinux
+  - nfs-utils
+  - nginx
+  - dnsmasq
+  - chrony
+  - skopeo
+  - zstd
+  - jq
+  - tar
+  - rsync
+  - httpd-tools
+  - policycoreutils-python-utils
+  - bash-completion
+  - bind-utils
+  - python3
+hpc_rpms_extra: []
+
+hpc_bundle_fetch: true          # false: only push an existing bundle (no internet needed)
+
+# rsync/ssh plumbing derived from the inventory (_h = target host)
+_hpc_rsh: >-
+  ssh -o BatchMode=yes -o LogLevel=ERROR
+  {{ hostvars[_h].ansible_ssh_common_args | default('') }}
+  {{ ('-p ' ~ hostvars[_h].ansible_port) if hostvars[_h].ansible_port is defined else '' }}
+  {{ ('-i ' ~ hostvars[_h].ansible_ssh_private_key_file) if hostvars[_h].ansible_ssh_private_key_file is defined else '' }}
+_hpc_rtarget: "{{ (hostvars[_h].ansible_user ~ '@') if hostvars[_h].ansible_user is defined else '' }}{{ hostvars[_h].ansible_host | default(_h) }}"
+_hpc_kube_version: "{{ hpc_rke2_version.split('+')[0] }}"
+_hpc_rke2_rpm_version: "{{ hpc_rke2_version[1:] | replace('+', '~') }}"
+_hpc_rke2_url: "https://github.com/rancher/rke2/releases/download/{{ hpc_rke2_version | urlencode }}"

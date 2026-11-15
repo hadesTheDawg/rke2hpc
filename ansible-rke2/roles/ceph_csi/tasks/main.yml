@@ -1,0 +1,59 @@
+---
+# CephFS CSI driver from the bundled chart, images from the system registry.
+# With hpc_ceph_cluster_id/monitors/user set it also creates the Ceph secret,
+# a StorageClass and a VolumeSnapshotClass. See docs/ceph.md.
+- name: Ceph kernel client available on this node
+  ansible.builtin.command: modprobe -n ceph
+  register: _mod
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ item }}"
+  loop: "{{ hpc_cluster_hosts }}"
+  become: true
+
+- name: Kernel client warning
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: no 'ceph' kernel module on {{ item.item }}. CephFS volumes cannot be mounted there
+      until the matching kernel-modules package is installed.
+  loop: "{{ _mod.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when: item.rc != 0
+
+- name: Admin tools
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: admin-tools
+
+- name: Namespace
+  ansible.builtin.shell:
+    cmd: "{{ hpc_kubectl }} create namespace {{ hpc_ceph_namespace }} --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -"
+  register: _ns
+  changed_when: "'created' in _ns.stdout"
+
+- name: Pin the driver's controller side to the admin node (node plugin runs everywhere)
+  ansible.builtin.command: >-
+    {{ hpc_kubectl }} label namespace {{ hpc_ceph_namespace }} --overwrite
+    hpc.io/platform=true pod-security.kubernetes.io/enforce=privileged
+  changed_when: false
+
+- name: Chart values
+  ansible.builtin.template:
+    src: values.yaml.j2
+    dest: /etc/hpc/ceph-csi-cephfs-values.yaml
+    mode: "0600"
+
+- name: ceph-csi-cephfs
+  ansible.builtin.command: >-
+    {{ hpc_helm }} upgrade --install ceph-csi-cephfs
+    {{ hpc_data_root }}/bundle/charts/ceph-csi-cephfs-{{ hpc_ceph_csi_chart_version }}.tgz
+    --namespace {{ hpc_ceph_namespace }} --wait --timeout 10m -f /etc/hpc/ceph-csi-cephfs-values.yaml
+  environment:
+    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+  changed_when: true
+
+- name: Without Ceph connection details only the driver is installed
+  ansible.builtin.debug:
+    msg: "ceph-csi-cephfs installed; set hpc_ceph_cluster_id, hpc_ceph_monitors, hpc_ceph_user_id/key to get the '{{ hpc_ceph_storage_class }}' StorageClass"
+  when: not (hpc_ceph_cluster_id and hpc_ceph_user_id)

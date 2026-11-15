@@ -1,0 +1,22 @@
+---
+# Helper scripts and tools on the admin node (include_role tasks_from: admin-tools).
+- name: Tool directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: [/usr/local/libexec/hpc, /usr/local/lib/hpc, /etc/hpc]
+- name: Helper scripts
+  ansible.builtin.copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0755"
+  loop:
+    - {src: hpc-pin-namespaces, dest: /usr/local/libexec/hpc/hpc-pin-namespaces}
+    - {src: hpc-apply-tlsstore, dest: /usr/local/libexec/hpc/hpc-apply-tlsstore}
+    - {src: hpc-sync.py, dest: /usr/local/sbin/hpc-sync}
+- name: Flat-file ingestion module
+  ansible.builtin.copy:
+    src: "{{ role_path }}/../tenants/files/hpc_flatfile.py"
+    dest: /usr/local/lib/hpc/hpc_flatfile.py
+    mode: "0644"

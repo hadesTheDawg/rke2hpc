@@ -1,0 +1,157 @@
+---
+# Everything here runs on the deployer (it needs internet), except the RPM
+# resolution, which runs on the rpm_fetch host.
+- name: Bundle directories
+  ansible.builtin.file:
+    path: "{{ hpc_bundle_dir }}/{{ item }}"
+    state: directory
+    mode: "0755"
+  loop: [bin, dl, rke2, charts, images/system, images/user, rpms]
+  delegate_to: localhost
+
+# ---- binaries --------------------------------------------------------------
+- name: Download binaries (checksums from upstream)
+  ansible.builtin.get_url:
+    url: "{{ item.url }}"
+    dest: "{{ hpc_bundle_dir }}/dl/{{ item.file }}"
+    checksum: "sha256:{{ item.url }}{{ item.sum }}"
+    mode: "0644"
+    timeout: 120
+  loop:
+    - {file: "registry-{{ hpc_registry_version }}.tar.gz", sum: .sha256,
+       url: "https://github.com/distribution/distribution/releases/download/v{{ hpc_registry_version }}/registry_{{ hpc_registry_version }}_linux_{{ hpc_arch }}.tar.gz"}
+    - {file: "helm-{{ hpc_helm_version }}.tar.gz", sum: .sha256sum,
+       url: "https://get.helm.sh/helm-{{ hpc_helm_version }}-linux-{{ hpc_arch }}.tar.gz"}
+    - {file: "kubectl-{{ _hpc_kube_version }}", sum: .sha256,
+       url: "https://dl.k8s.io/release/{{ _hpc_kube_version }}/bin/linux/{{ hpc_arch }}/kubectl"}
+    - {file: "kubelogin-{{ hpc_kubelogin_version }}.zip", sum: .sha256,
+       url: "https://github.com/int128/kubelogin/releases/download/{{ hpc_kubelogin_version }}/kubelogin_linux_{{ hpc_arch }}.zip"}
+  delegate_to: localhost
+
+- name: Unpack binaries
+  ansible.builtin.shell:
+    cmd: |
+      set -e; t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+      tar -xzf dl/registry-{{ hpc_registry_version }}.tar.gz -C "$t" registry
+      tar -xzf dl/helm-{{ hpc_helm_version }}.tar.gz -C "$t" linux-{{ hpc_arch }}/helm
+      unzip -oq dl/kubelogin-{{ hpc_kubelogin_version }}.zip kubelogin -d "$t"
+      install -m 0755 "$t/registry" bin/registry
+      install -m 0755 "$t/linux-{{ hpc_arch }}/helm" bin/helm
+      install -m 0755 dl/kubectl-{{ _hpc_kube_version }} bin/kubectl
+      install -m 0755 "$t/kubelogin" bin/kubectl-oidc_login
+      echo "{{ hpc_registry_version }} {{ hpc_helm_version }} {{ _hpc_kube_version }} {{ hpc_kubelogin_version }}" > bin/VERSIONS
+    chdir: "{{ hpc_bundle_dir }}"
+  register: _unpack
+  changed_when: true
+  when: lookup('ansible.builtin.file', hpc_bundle_dir ~ '/bin/VERSIONS', errors='ignore') !=
+        hpc_registry_version ~ ' ' ~ hpc_helm_version ~ ' ' ~ _hpc_kube_version ~ ' ' ~ hpc_kubelogin_version
+  delegate_to: localhost
+
+# ---- RKE2 image tarballs ------------------------------------------------------
+- name: RKE2 checksums
+  ansible.builtin.get_url:
+    url: "{{ _hpc_rke2_url }}/sha256sum-{{ hpc_arch }}.txt"
+    dest: "{{ hpc_bundle_dir }}/rke2/sha256sum-{{ hpc_arch }}.txt"
+    force: true
+    mode: "0644"
+  delegate_to: localhost
+
+- name: RKE2 image tarballs
+  ansible.builtin.get_url:
+    url: "{{ _hpc_rke2_url }}/{{ item }}"
+    dest: "{{ hpc_bundle_dir }}/rke2/{{ item }}"
+    checksum: "sha256:{{ lookup('ansible.builtin.file', hpc_bundle_dir ~ '/rke2/sha256sum-' ~ hpc_arch ~ '.txt').splitlines()
+                | select('search', ' ' ~ item ~ '$') | first | split | first }}"
+    mode: "0644"
+    timeout: 600
+  loop:
+    - "rke2-images-core.linux-{{ hpc_arch }}.tar.zst"
+    - "rke2-images-{{ hpc_rke2_cni }}.linux-{{ hpc_arch }}.tar.zst"
+  delegate_to: localhost
+
+- name: Drop tarballs of other versions/CNIs
+  ansible.builtin.shell:
+    cmd: |
+      for f in rke2/*.tar.zst; do
+        case "$(basename "$f")" in
+          rke2-images-core.linux-{{ hpc_arch }}.tar.zst|rke2-images-{{ hpc_rke2_cni }}.linux-{{ hpc_arch }}.tar.zst) ;;
+          *) rm -f "$f"; echo removed ;;
+        esac
+      done
+      echo "{{ hpc_rke2_version }}" > rke2/VERSION
+    chdir: "{{ hpc_bundle_dir }}"
+  register: _prune
+  changed_when: "'removed' in _prune.stdout"
+  delegate_to: localhost
+
+# ---- helm charts ------------------------------------------------------------
+- name: Helm charts
+  ansible.builtin.get_url:
+    url: "{{ item }}"
+    dest: "{{ hpc_bundle_dir }}/charts/{{ item | basename }}"
+    mode: "0644"
+  loop:
+    - "https://releases.rancher.com/server-charts/stable/rancher-{{ hpc_rancher_version }}.tgz"
+    - "https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner/releases/download/nfs-subdir-external-provisioner-{{ hpc_nfs_provisioner_chart_version }}/nfs-subdir-external-provisioner-{{ hpc_nfs_provisioner_chart_version }}.tgz"
+    - "https://ceph.github.io/csi-charts/cephfs/ceph-csi-cephfs-{{ hpc_ceph_csi_chart_version }}.tgz"
+  delegate_to: localhost
+
+# ---- container images -----------------------------------------------------------
+- name: Container images
+  ansible.builtin.command:
+    argv: "{{ [role_path ~ '/files/fetch-images.sh', hpc_arch, hpc_bundle_dir ~ '/images/' ~ item.set] + item.refs }}"
+  loop:
+    - {set: system, refs: "{{ hpc_images_system + (hpc_images_ceph if hpc_bundle_ceph | bool else []) }}"}
+    - {set: user, refs: "{{ hpc_images_user }}"}
+  loop_control:
+    label: "{{ item.set }} ({{ item.refs | length }} images)"
+  register: _imgs
+  changed_when: "'changed' in _imgs.stdout"
+  delegate_to: localhost
+
+# ---- RPMs -------------------------------------------------------------------
+- name: Offline RPM repository
+  when: hpc_offline_repo | bool
+  block:
+    - name: An RPM fetch host is defined
+      ansible.builtin.assert:
+        that: hpc_rpm_fetch_host | length > 0
+        fail_msg: >-
+          hpc_offline_repo is true but the inventory has no 'rpm_fetch' host. Add an
+          internet-connected EL{{ hpc_el_major }} {{ hpc_rpm_arch }} host to group rpm_fetch,
+          or set hpc_offline_repo=false if the nodes have their own package repositories.
+
+    - name: Resolve RPMs with their dependency closure
+      ansible.builtin.script:
+        cmd: fetch-rpms.sh
+      environment:
+        RPM_PACKAGES: "{{ (hpc_rpms + hpc_rpms_extra) | join(' ') }}"
+        RKE2_RPM_VERSION: "{{ _hpc_rke2_rpm_version }}"
+        EL_MAJOR: "{{ hpc_el_major }}"
+        RPM_ARCH: "{{ hpc_rpm_arch }}"
+      become: true
+      delegate_to: "{{ hpc_rpm_fetch_host }}"
+      register: _rpms
+      changed_when: false
+
+    - name: Copy the repository to the deployer
+      ansible.builtin.command:
+        argv: [rsync, -rlt, --delete, -e, "{{ _hpc_rsh }}",
+               "{{ _hpc_rtarget }}:/var/tmp/hpc-rpm-fetch/repo/", "{{ hpc_bundle_dir }}/rpms/"]
+      vars: {_h: "{{ hpc_rpm_fetch_host }}"}
+      changed_when: false
+      delegate_to: localhost
+
+- name: Bundle manifest
+  ansible.builtin.copy:
+    dest: "{{ hpc_bundle_dir }}/MANIFEST"
+    mode: "0644"
+    content: |
+      arch={{ hpc_arch }}
+      rke2={{ hpc_rke2_version }}
+      rancher={{ hpc_rancher_version }}
+      keycloak={{ hpc_keycloak_version }}
+      registry={{ hpc_registry_version }}
+      ceph_csi={{ hpc_ceph_csi_chart_version }}
+      offline_repo={{ hpc_offline_repo }}
+  delegate_to: localhost

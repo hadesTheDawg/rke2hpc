@@ -1,0 +1,43 @@
+# Site settings. Defaults (with comments) are in
+# roles/hpc_common/defaults/main.yml and roles/bundle/defaults/main.yml;
+# docs/variables.md lists them. Put secrets (Ceph key) in a vault file:
+#   ansible-vault create inventories/<site>/group_vars/vault.yml
+
+hpc_arch: amd64
+hpc_cluster_name: hpc
+hpc_domain: hpc.example.org        # names below it resolve to the admin node
+
+# ---- networks ----------------------------------------------------------------
+hpc_mgmt_iface: bond0              # node IP, API, registry, NFS, ssh
+hpc_pod_iface: hsn0                # pod-to-pod overlay
+hpc_pod_mtu: 0                     # 0 = 1450; with a 9000-byte HSN set 8950
+hpc_cluster_cidr: 10.42.0.0/16     # must not overlap bond0 / hsn networks
+hpc_service_cidr: 10.43.0.0/16
+# hpc_node_cidrs: [172.16.0.0/22, 10.150.0.0/16, 10.200.0.0/16]  # bond0, hsn, storage: blocked for pods
+
+# ---- packages / offline ---------------------------------------------------------
+hpc_offline: true                  # nodes have no internet
+hpc_offline_repo: true             # RPMs from the bundle (needs the rpm_fetch host); false = site repos
+
+# ---- DNS / time ------------------------------------------------------------------
+hpc_manage_dns: true               # dnsmasq on the admin node for {{ hpc_domain }}
+hpc_coredns_forward_domain: true
+hpc_ntp_servers: []                # e.g. [ntp1.example.org]
+
+# ---- storage -----------------------------------------------------------------------
+hpc_storage_backend: nfs           # nfs | cephfs | none  (default StorageClass)
+hpc_enable_ceph_csi: false         # true to install the CephFS driver
+# hpc_ceph_cluster_id: "b5a1...fsid"
+# hpc_ceph_monitors: ["10.200.0.1:6789", "10.200.0.2:6789", "10.200.0.3:6789"]
+# hpc_ceph_fs_name: cephfs
+# hpc_ceph_user_id: k8s
+# hpc_ceph_user_key: "{{ vault_ceph_user_key }}"
+# Homes mounted into pods (NFS). Point at an external server if homes live elsewhere:
+# hpc_home_nfs_server: 172.16.0.20
+# hpc_home_nfs_path: /export/home
+# hpc_home_create_root: ""          # homes are created by the site, not by hpc-sync
+# hpc_home_volume: none             # do not mount homes into pods
+
+# ---- identity --------------------------------------------------------------------
+hpc_platform_admin_users: [opsadmin]
+hpc_keycloak_allow_password_grant: false   # true only while running verify.yml

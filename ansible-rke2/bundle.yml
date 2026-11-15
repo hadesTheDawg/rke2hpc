@@ -1,0 +1,14 @@
+---
+# Download the offline bundle (needs internet on this machine and on the
+# rpm_fetch host) and push it to the admin node. site.yml does the same.
+#   ansible-playbook -i inventories/<site>/hosts.yml bundle.yml [-e hpc_bundle_fetch=false]
+- name: Facts
+  hosts: rke2_servers
+  gather_facts: true
+  become: false
+  roles: [preflight]
+
+- name: Offline bundle
+  hosts: rke2_servers
+  gather_facts: false
+  roles: [bundle]

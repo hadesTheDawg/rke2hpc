@@ -1,0 +1,12 @@
+# Project groups, one per line:
+#   GROUP:CPU:MEMORY_MIB:STORAGE_GIB:CPU_HOURS: user, user, ...
+#
+#   CPU / MEMORY_MIB / STORAGE_GIB  what the group may hold at any one moment (shared, enforced)
+#   CPU_HOURS                       yearly CPU-hour allocation that usage is reported against.
+#                                   Optional and NOT enforced: see docs/flatfile.md
+# A user may appear in several groups. UIDs/GIDs are allocated once and never reused.
+BS0001:24:16000:20:1: bob, alice, amy
+CH0002:16:32000:50:100: carol, dave, erin
+PH0003:32:64000:100:500: frank, grace
+ML0004:48:96000:200:2000: heidi, ivan, judy, alice
+EN0005:8:8000:10:50: mallory, niaj

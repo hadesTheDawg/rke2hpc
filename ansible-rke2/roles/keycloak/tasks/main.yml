@@ -1,0 +1,58 @@
+---
+# Keycloak (production mode, behind the ingress) with a dedicated PostgreSQL on
+# the admin node's local disk.
+- name: Database directory
+  ansible.builtin.file:
+    path: "{{ hpc_keycloak_db_dir }}"
+    state: directory
+    owner: "999"
+    group: "999"
+    mode: "0700"
+
+- name: SELinux label for the database directory
+  ansible.builtin.shell:
+    cmd: |
+      semanage fcontext -a -t container_file_t "{{ hpc_keycloak_db_dir }}(/.*)?" 2>/dev/null || true
+      restorecon -R {{ hpc_keycloak_db_dir }}
+  changed_when: false
+
+- name: Credentials, TLS and CA
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      k="{{ hpc_kubectl }} -n keycloak"
+      $k create secret generic keycloak-credentials --from-literal=admin-password="$ADMIN_PW" \
+        --from-literal=db-password="$DB_PW" --dry-run=client -o yaml | $k apply -f -
+      $k create secret tls keycloak-tls --cert=/etc/pki/hpc/ingress.crt --key=/etc/pki/hpc/ingress.key \
+        --dry-run=client -o yaml | $k apply -f -
+      $k create configmap hpc-ca --from-file=ca.crt=/etc/pki/hpc/ca.crt --dry-run=client -o yaml | $k apply -f -
+  environment:
+    ADMIN_PW: "{{ hpc_keycloak_admin_password }}"
+    DB_PW: "{{ hpc_keycloak_db_password }}"
+  register: _kcsec
+  changed_when: "'configured' in _kcsec.stdout or 'created' in _kcsec.stdout"
+  no_log: true
+
+- name: Manifests
+  ansible.builtin.template:
+    src: keycloak.yaml.j2
+    dest: /etc/hpc/keycloak.yaml
+    mode: "0600"
+
+- name: Apply
+  ansible.builtin.command: "{{ hpc_kubectl }} apply -f /etc/hpc/keycloak.yaml"
+  register: _apply
+  changed_when: "'configured' in _apply.stdout or 'created' in _apply.stdout"
+
+- name: Rollouts
+  ansible.builtin.command: "{{ hpc_kubectl }} -n keycloak rollout status {{ item }} --timeout=600s"
+  loop: [statefulset/keycloak-db, deployment/keycloak]
+  changed_when: false
+
+- name: Keycloak answers through the ingress
+  ansible.builtin.uri:
+    url: "https://{{ hpc_keycloak_host }}/realms/master/.well-known/openid-configuration"
+  register: _kc
+  until: _kc is succeeded
+  retries: 60
+  delay: 5

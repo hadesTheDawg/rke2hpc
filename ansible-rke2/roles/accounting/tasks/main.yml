@@ -1,0 +1,76 @@
+---
+# Usage accounting recorder (systemd on the admin node). It observes; it
+# enforces nothing. Admin tool: ssh <admin> sudo hpc-acct status (or acct.yml).
+- name: Flat file has been ingested
+  ansible.builtin.stat:
+    path: /var/lib/hpc/projects.json
+  register: _pj
+
+- name: Tenants first
+  ansible.builtin.assert:
+    that: _pj.stat.exists
+    fail_msg: "no parsed flat file on the admin node yet; run the tenants role first"
+
+- name: hpc-acct
+  ansible.builtin.copy:
+    src: hpc-acct.py
+    dest: /usr/local/sbin/hpc-acct
+    mode: "0755"
+  register: _tool
+
+- name: hpc-acct on sudo's PATH (secure_path has no /usr/local)
+  ansible.builtin.file:
+    src: /usr/local/sbin/hpc-acct
+    dest: /usr/sbin/hpc-acct
+    state: link
+
+- name: State directory
+  ansible.builtin.file:
+    path: /var/lib/hpc/acct
+    state: directory
+    mode: "0700"
+
+- name: Settings
+  ansible.builtin.copy:
+    dest: /etc/hpc/acct.env
+    mode: "0644"
+    content: |
+      # managed by ansible (hpc accounting)
+      ACCT_POLL_SECONDS={{ hpc_acct_poll_seconds }}
+      ACCT_PERIOD_START={{ hpc_acct_period_start }}
+      TENANT_DEFAULT_CPU_REQUEST={{ hpc_tenant_default_cpu_request }}
+  register: _env
+
+- name: systemd unit
+  ansible.builtin.copy:
+    dest: /etc/systemd/system/hpc-acct.service
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=HPC job accounting recorder
+      After=rke2-server.service
+      Wants=rke2-server.service
+
+      [Service]
+      ExecStart=/usr/bin/python3 /usr/local/sbin/hpc-acct daemon
+      Restart=always
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+  register: _unit
+
+- name: Recorder running
+  ansible.builtin.systemd_service:
+    name: hpc-acct
+    enabled: true
+    daemon_reload: "{{ _unit.changed }}"
+    state: "{{ 'restarted' if (_tool.changed or _env.changed or _unit.changed) else 'started' }}"
+
+- name: Recorder is active
+  ansible.builtin.command: systemctl is-active hpc-acct
+  register: _act
+  until: _act.rc == 0
+  retries: 5
+  delay: 2
+  changed_when: false

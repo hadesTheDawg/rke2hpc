@@ -1,0 +1,9 @@
+---
+- name: Fetch the bundle
+  ansible.builtin.include_tasks: fetch.yml
+  when: hpc_bundle_fetch | bool
+  run_once: true
+
+- name: Push the bundle to the admin node
+  ansible.builtin.include_tasks: push.yml
+  run_once: true

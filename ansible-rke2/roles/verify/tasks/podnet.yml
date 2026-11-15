@@ -1,0 +1,79 @@
+---
+# Two project pods on different compute nodes move 64 MiB; the bytes must show
+# up on the pod interface ({{ hpc_pod_iface }}) of the receiving node, not on
+# its management interface ({{ hpc_mgmt_iface }}).
+- name: Nodes for the transfer
+  ansible.builtin.set_fact:
+    _srv_node: "{{ hpc_compute_hosts[0] }}"
+    _cli_node: "{{ hpc_compute_hosts[1] }}"
+    _ns: "{{ _a.ns }}"
+    _pod_if: "{{ hpc_pod_iface or hpc_mgmt_iface }}"
+
+- name: Overlay device uses the pod interface
+  ansible.builtin.shell:
+    cmd: "ip -d link show flannel.1 | grep -o 'dev [^ ]*' | head -1"
+  register: _vx
+  changed_when: false
+  delegate_to: "{{ item }}"
+  loop: "{{ hpc_compute_hosts }}"
+
+- name: Sender pod
+  ansible.builtin.shell:
+    cmd: |
+      k="{{ hpc_kubectl }} -n {{ _ns }}"
+      $k delete pod podnet-srv podnet-cli --ignore-not-found --wait=true >/dev/null
+      $k run podnet-srv --image=busybox:1.37 --restart=Never \
+        --overrides='{"spec":{"activeDeadlineSeconds":300,"nodeSelector":{"kubernetes.io/hostname":"{{ _srv_node }}"}}}' \
+        -- sh -c 'mkdir -p /tmp/w && head -c 67108864 /dev/urandom > /tmp/w/blob && httpd -f -p 8080 -h /tmp/w' >/dev/null
+      $k wait --for=condition=Ready pod/podnet-srv --timeout=120s >/dev/null
+      sleep 2
+      $k get pod podnet-srv -o jsonpath='{.status.podIP}'
+  register: _srv
+  changed_when: false
+
+- name: Counters before
+  ansible.builtin.shell:
+    cmd: "cat /sys/class/net/{{ _pod_if }}/statistics/rx_bytes /sys/class/net/{{ hpc_mgmt_iface }}/statistics/rx_bytes"
+  register: _c0
+  changed_when: false
+  delegate_to: "{{ _cli_node }}"
+
+- name: Receiver pod fetches the blob
+  ansible.builtin.shell:
+    cmd: |
+      k="{{ hpc_kubectl }} -n {{ _ns }}"
+      $k run podnet-cli --image=busybox:1.37 --restart=Never \
+        --overrides='{"spec":{"activeDeadlineSeconds":300,"nodeSelector":{"kubernetes.io/hostname":"{{ _cli_node }}"}}}' \
+        -- sh -c 'wget -q -O /dev/null http://{{ _srv.stdout }}:8080/blob && echo done' >/dev/null
+      $k wait --for=jsonpath='{.status.phase}'=Succeeded pod/podnet-cli --timeout=180s >/dev/null && $k logs podnet-cli
+  register: _cli
+  changed_when: false
+  failed_when: false
+
+- name: Counters after
+  ansible.builtin.shell:
+    cmd: "cat /sys/class/net/{{ _pod_if }}/statistics/rx_bytes /sys/class/net/{{ hpc_mgmt_iface }}/statistics/rx_bytes"
+  register: _c1
+  changed_when: false
+  delegate_to: "{{ _cli_node }}"
+
+- name: Clean up
+  ansible.builtin.command: "{{ hpc_kubectl }} -n {{ _ns }} delete pod podnet-srv podnet-cli --wait=true --timeout=120s"
+  changed_when: false
+
+- name: Evaluate
+  ansible.builtin.set_fact:
+    _d_pod: "{{ (_c1.stdout_lines[0] | int - _c0.stdout_lines[0] | int) // 1048576 }}"
+    _d_mgmt: "{{ (_c1.stdout_lines[1] | int - _c0.stdout_lines[1] | int) // 1048576 }}"
+    _vx_ok: "{{ _vx.results | map(attribute='stdout') | unique | list == ['dev ' ~ _pod_if] }}"
+
+- name: Pod network result
+  ansible.builtin.set_fact:
+    _podnet_ok: "{{ _vx_ok and 'done' in _cli.stdout and (_d_pod | int) >= 60 and (_d_mgmt | int) < 8 }}"
+    _podnet_count: 2
+
+- name: Pod network report
+  ansible.builtin.debug:
+    msg:
+      - "{{ 'PASS' if _vx_ok else 'FAIL' }}  VXLAN overlay on every compute node is bound to {{ _pod_if }} ({{ _vx.results | map(attribute='stdout') | unique | join(', ') }})"
+      - "{{ 'PASS' if _podnet_ok else 'FAIL' }}  64 MiB pod-to-pod {{ _srv_node }} -> {{ _cli_node }} arrived over {{ _pod_if }} (+{{ _d_pod }} MiB), not {{ hpc_mgmt_iface }} (+{{ _d_mgmt }} MiB) [{{ _cli.stdout | default('') | trim }}]"

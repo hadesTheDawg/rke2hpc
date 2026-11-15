@@ -1,0 +1,10 @@
+# managed by ansible (hpc rke2)
+{{ ({
+  'server': 'https://' ~ hpc_kube_api_host ~ ':9345',
+  'token': hpc_rke2_agent_token,
+  'node-name': inventory_hostname,
+  'node-ip': hpc_mgmt_ip,
+  'system-default-registry': hpc_sysreg,
+  'selinux': true,
+  'node-label': ['hpc.io/role=compute'],
+} | combine(hpc_rke2_extra_agent_config)) | to_nice_yaml(indent=2) }}

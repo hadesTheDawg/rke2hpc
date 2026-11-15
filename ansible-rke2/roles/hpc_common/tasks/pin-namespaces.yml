@@ -1,0 +1,6 @@
+---
+- name: Pin platform namespaces to the admin node
+  ansible.builtin.command:
+    argv: [/usr/local/libexec/hpc/hpc-pin-namespaces, "{{ hpc_admin_host }}", "{{ hpc_unpinned_namespaces | join(' ') }}"]
+  register: _pin
+  changed_when: _pin.stdout | length > 0

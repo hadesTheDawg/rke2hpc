@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Traefik's TLS store: the site ingress certificate is the default; the
+# per-project wildcard certificate (tenants role) is added once it exists.
+set -euo pipefail
+K="/var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml"
+extra=""
+if $K -n kube-system get secret hpc-apps-tls >/dev/null 2>&1; then
+  extra=$'\n  certificates:\n  - secretName: hpc-apps-tls'
+fi
+$K apply -f - <<YAML
+apiVersion: traefik.io/v1alpha1
+kind: TLSStore
+metadata:
+  name: default
+  namespace: kube-system
+spec:
+  defaultCertificate:
+    secretName: hpc-ingress-tls$extra
+YAML

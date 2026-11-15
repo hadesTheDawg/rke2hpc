@@ -1,0 +1,18 @@
+---
+# Run the accounting admin tool from the deployer:
+#   ansible-playbook -i inventories/<site>/hosts.yml acct.yml -e 'acct="status"'
+#   ansible-playbook -i ... acct.yml -e 'acct="jobs --project BS0001"'
+#   ansible-playbook -i ... acct.yml -e 'acct="budget BS0001 --add 10 --reason extra"'
+# (or: ssh <admin node> sudo hpc-acct status)
+- name: hpc-acct
+  hosts: rke2_servers
+  gather_facts: false
+  become: true
+  tasks:
+    - name: "hpc-acct {{ acct | default('status') }}"
+      ansible.builtin.shell: "/usr/local/sbin/hpc-acct {{ acct | default('status') }}"
+      register: _out
+      changed_when: false
+    - name: Output
+      ansible.builtin.debug:
+        msg: "{{ _out.stdout_lines }}"

@@ -1,0 +1,112 @@
+---
+# Project groups from the flat file: unix ids, homes, namespaces, quotas,
+# isolation, Rancher projects, Keycloak users and groups. Re-run after every
+# change to the flat file (tenants.yml). The format is defined in
+# roles/tenants/files/hpc_flatfile.py (FIELDS).
+
+- name: Parse and validate the flat file (on the deployer)
+  ansible.builtin.command:
+    argv: [python3, "{{ role_path }}/files/hpc_flatfile.py", json, "{{ hpc_projects_file }}"]
+  environment:
+    TENANT_DEFAULT_CPU_HOURS: "{{ hpc_tenant_default_cpu_hours }}"
+  register: _ff
+  changed_when: false
+  delegate_to: localhost
+  become: false
+
+- name: Projects
+  ansible.builtin.set_fact:
+    _projects: "{{ (_ff.stdout | from_json).projects }}"
+    _users: "{{ (_ff.stdout | from_json).users }}"
+
+- name: Summary
+  ansible.builtin.debug:
+    msg: "{{ _projects | length }} projects, {{ _users | length }} users: {{ _projects | map(attribute='group') | join(', ') }}"
+
+- name: Initial passwords (shared by Keycloak and any unix account made from accounts.json)
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: user-passwords
+
+# Tenant apps live at <app>.<namespace>.<apps domain>. A wildcard covers one
+# label, so the ingress gets one wildcard per project.
+- name: Project application certificate
+  ansible.builtin.include_role:
+    name: pki
+    tasks_from: issue
+    apply:
+      delegate_to: localhost
+      become: false
+  vars:
+    cert:
+      name: apps
+      sans: "{{ _projects | map(attribute='ns') | map('regex_replace', '^(.*)$', '*.\\1.' ~ hpc_apps_domain) | join(',') }}"
+
+- name: Certificate on the admin node
+  ansible.builtin.copy:
+    src: "{{ hpc_secrets_dir }}/pki/{{ item.f }}"
+    dest: "/etc/pki/hpc/{{ item.f }}"
+    mode: "{{ item.m }}"
+  loop: [{f: apps.crt, m: "0644"}, {f: apps.key, m: "0600"}]
+
+- name: Admin tools
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: admin-tools
+
+- name: Flat file on the admin node
+  ansible.builtin.copy:
+    src: "{{ hpc_projects_file }}"
+    dest: /etc/hpc/projects.txt
+    mode: "0600"
+
+# A rebuilt admin node gets its uid/gid allocations back from the last backup.
+- name: Id map on the admin node
+  ansible.builtin.stat:
+    path: /var/lib/hpc/idmap.json
+  register: _idmap
+
+- name: Restore the id map from the deployer's backup
+  ansible.builtin.copy:
+    src: "{{ hpc_secrets_dir }}/state/idmap.json"
+    dest: /var/lib/hpc/idmap.json
+    mode: "0600"
+  when: not _idmap.stat.exists and lookup('ansible.builtin.fileglob', hpc_secrets_dir ~ '/state/idmap.json') | length > 0
+
+- name: hpc-sync tenants
+  ansible.builtin.command: /usr/bin/python3 /usr/local/sbin/hpc-sync tenants
+  environment: "{{ hpc_sync_env | combine({'HPC_PASSWORDS': hpc_user_passwords}) }}"
+  register: _sync
+  changed_when: "'created' in _sync.stderr or 'updated' in _sync.stderr or 'disabled' in _sync.stderr"
+
+- name: hpc-sync output
+  ansible.builtin.debug:
+    msg: "{{ _sync.stderr_lines }}"
+
+- name: Pin platform namespaces
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: pin-namespaces
+
+- name: Project certificate for the ingress
+  ansible.builtin.shell:
+    cmd: >-
+      {{ hpc_kubectl }} -n kube-system create secret tls hpc-apps-tls
+      --cert=/etc/pki/hpc/apps.crt --key=/etc/pki/hpc/apps.key --dry-run=client -o yaml
+      | {{ hpc_kubectl }} apply -f -
+  register: _apps
+  changed_when: "'configured' in _apps.stdout or 'created' in _apps.stdout"
+
+- name: Traefik TLS store
+  ansible.builtin.command: /usr/local/libexec/hpc/hpc-apply-tlsstore
+  register: _tls
+  changed_when: "'unchanged' not in _tls.stdout"
+
+# idmap.json is what keeps uids/gids stable across redeploys; accounts.json is
+# the user/group list for login nodes or a directory service.
+- name: Back up the id map and account list to the deployer
+  ansible.builtin.fetch:
+    src: "/var/lib/hpc/{{ item }}"
+    dest: "{{ hpc_secrets_dir }}/state/{{ item }}"
+    flat: true
+  loop: [idmap.json, accounts.json]

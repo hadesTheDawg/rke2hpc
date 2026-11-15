@@ -1,0 +1,20 @@
+# managed by ansible (hpc rke2)
+mirrors:
+  docker.io:
+    endpoint: ["https://{{ hpc_usrreg }}", "https://{{ hpc_sysreg }}"]
+  quay.io:
+    endpoint: ["https://{{ hpc_sysreg }}"]
+  ghcr.io:
+    endpoint: ["https://{{ hpc_sysreg }}"]
+  registry.k8s.io:
+    endpoint: ["https://{{ hpc_sysreg }}"]
+configs:
+  "{{ hpc_sysreg }}":
+    auth:
+      username: pull
+      password: "{{ hpc_registry_pull_password }}"
+    tls:
+      ca_file: /etc/pki/ca-trust/source/anchors/hpc-ca.crt
+  "{{ hpc_usrreg }}":
+    tls:
+      ca_file: /etc/pki/ca-trust/source/anchors/hpc-ca.crt

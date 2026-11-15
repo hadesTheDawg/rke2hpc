@@ -1,0 +1,21 @@
+# managed by ansible (hpc rke2)
+{{ ({
+  'node-name': inventory_hostname,
+  'node-ip': hpc_mgmt_ip,
+  'advertise-address': hpc_mgmt_ip,
+  'tls-san': [hpc_kube_api_host, inventory_hostname, inventory_hostname ~ '.' ~ hpc_domain, hpc_mgmt_ip],
+  'token': hpc_rke2_server_token,
+  'agent-token': hpc_rke2_agent_token,
+  'system-default-registry': hpc_sysreg,
+  'cni': hpc_rke2_cni,
+  'cluster-cidr': hpc_cluster_cidr,
+  'service-cidr': hpc_service_cidr,
+  'ingress-controller': 'traefik',
+  'selinux': true,
+  'write-kubeconfig-mode': '0600',
+  'etcd-snapshot-retention': hpc_rke2_etcd_snapshot_retention,
+  'node-label': ['hpc.io/role=admin'],
+  'kube-apiserver-arg': [
+    'authentication-config=/var/lib/rancher/rke2/server/etc/hpc-authentication.yaml',
+    'enable-admission-plugins=NodeRestriction,PodNodeSelector'],
+} | combine(hpc_rke2_extra_server_config)) | to_nice_yaml(indent=2) }}

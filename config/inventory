@@ -1,0 +1,8 @@
+# name   role      ip
+# roles: login (kubectl only, not a cluster node) | admin (RKE2 server, registries,
+#        NFS, repo) | compute (RKE2 agents; the only place tenant pods run)
+l1       login     10.10.0.5
+a1       admin     10.10.0.10
+c1       compute   10.10.0.21
+c2       compute   10.10.0.22
+c3       compute   10.10.0.23

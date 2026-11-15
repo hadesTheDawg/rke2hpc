@@ -1,0 +1,36 @@
+---
+# OIDC: Keycloak usernames are the unix names; groups get a prefix so they can
+# never collide with built-in groups such as system:masters. The file lives
+# under server/etc so the SELinux policy lets kube-apiserver watch it.
+- name: Server directories
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop: [/var/lib/rancher/rke2/server/etc, /var/lib/rancher/rke2/server/manifests]
+  register: _dirs
+
+- name: SELinux labels of the server directories
+  ansible.builtin.command: restorecon -R /var/lib/rancher/rke2/server
+  when: _dirs.changed
+
+- name: Server configuration files
+  ansible.builtin.template:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    mode: "0600"
+  loop:
+    - {src: authentication.yaml.j2, dest: /var/lib/rancher/rke2/server/etc/hpc-authentication.yaml}
+    # cluster add-on configuration, applied by RKE2's helm controller
+    - {src: hpc-traefik-config.yaml.j2, dest: /var/lib/rancher/rke2/server/manifests/hpc-traefik-config.yaml}
+    - {src: hpc-canal-config.yaml.j2, dest: /var/lib/rancher/rke2/server/manifests/hpc-canal-config.yaml}
+    - {src: hpc-coredns-config.yaml.j2, dest: /var/lib/rancher/rke2/server/manifests/hpc-coredns-config.yaml}
+  loop_control:
+    label: "{{ item.dest | basename }}"
+  register: _srvfiles
+
+# The authentication file is reloaded by the API server; the manifests by the
+# helm controller. Neither needs a restart.
+- name: Server files changed
+  ansible.builtin.set_fact:
+    _server_cfg_changed: false

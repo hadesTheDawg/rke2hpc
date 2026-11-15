@@ -1,0 +1,16 @@
+---
+# Re-run after every edit of the flat file:
+#   ansible-playbook -i inventories/<site>/hosts.yml tenants.yml
+# Validate an edit first, without touching anything:
+#   python3 roles/tenants/files/hpc_flatfile.py check inventories/<site>/projects.txt
+- name: Facts
+  hosts: rke2_servers:rke2_agents
+  gather_facts: true
+  become: false
+  roles: [preflight]
+
+- name: Projects from the flat file
+  hosts: rke2_servers
+  gather_facts: false
+  become: true
+  roles: [tenants]

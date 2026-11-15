@@ -1,0 +1,60 @@
+---
+# The bundle is copied as the ssh user into a directory that user owns, so the
+# copy needs no passwordless sudo. Services read it as root.
+- name: Bundle present on the deployer
+  ansible.builtin.stat:
+    path: "{{ hpc_bundle_dir }}/MANIFEST"
+  register: _manifest
+  delegate_to: localhost
+
+- name: Bundle exists
+  ansible.builtin.assert:
+    that: _manifest.stat.exists
+    fail_msg: "no bundle at {{ hpc_bundle_dir }}; run with hpc_bundle_fetch=true (needs internet) first"
+
+- name: Bundle directory on the admin node
+  ansible.builtin.file:
+    path: "{{ hpc_data_root }}/bundle"
+    state: directory
+    owner: "{{ hostvars[hpc_admin_host].ansible_facts.user_id }}"
+    mode: "0755"
+  become: true
+  delegate_to: "{{ hpc_admin_host }}"
+
+- name: Is rsync installed on the admin node
+  ansible.builtin.command: rpm -q rsync
+  register: _rsync
+  changed_when: false
+  failed_when: false
+  delegate_to: "{{ hpc_admin_host }}"
+
+- name: Install rsync from the bundle (the admin node has no repositories yet)
+  when: _rsync.rc != 0
+  block:
+    - name: Find the rsync package in the bundle
+      ansible.builtin.find:
+        paths: "{{ hpc_bundle_dir }}/rpms"
+        patterns: "rsync-[0-9]*.rpm"
+      register: _rsync_rpm
+      delegate_to: localhost
+    - name: Copy it
+      ansible.builtin.copy:
+        src: "{{ _rsync_rpm.files[0].path }}"
+        dest: /var/tmp/hpc-rsync.rpm
+        mode: "0644"
+      become: true
+      delegate_to: "{{ hpc_admin_host }}"
+    - name: Install it
+      ansible.builtin.command: rpm -i /var/tmp/hpc-rsync.rpm
+      become: true
+      delegate_to: "{{ hpc_admin_host }}"
+      changed_when: true
+
+- name: Sync the bundle (incremental)
+  ansible.builtin.command:
+    argv: [rsync, -rlt, --delete, --itemize-changes, -e, "{{ _hpc_rsh }}",
+           "{{ hpc_bundle_dir }}/", "{{ _hpc_rtarget }}:{{ hpc_data_root }}/bundle/"]
+  vars: {_h: "{{ hpc_admin_host }}"}
+  register: _push
+  changed_when: _push.stdout | length > 0
+  delegate_to: localhost

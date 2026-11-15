@@ -1,0 +1,107 @@
+---
+# ---- repo server (nginx, TLS) ------------------------------------------------
+- name: Repository server
+  when: hpc_offline_repo | bool
+  block:
+    - name: Packages
+      ansible.builtin.dnf:
+        name: [nginx, policycoreutils-python-utils]
+        state: present
+    - name: Web root
+      ansible.builtin.file:
+        path: "{{ hpc_data_root }}/www"
+        state: directory
+        mode: "0755"
+    - name: CA published at /ca.crt
+      ansible.builtin.copy:
+        src: /etc/pki/hpc/ca.crt
+        dest: "{{ hpc_data_root }}/www/ca.crt"
+        remote_src: true
+        mode: "0644"
+    - name: SELinux label for served content
+      ansible.builtin.shell:
+        cmd: |
+          for t in {{ hpc_data_root }}/www {{ hpc_data_root }}/bundle/rpms; do
+            semanage fcontext -a -t httpd_sys_content_t "$t(/.*)?" 2>/dev/null \
+              || semanage fcontext -m -t httpd_sys_content_t "$t(/.*)?"
+            restorecon -R "$t"
+          done
+      changed_when: false
+    - name: nginx.conf
+      ansible.builtin.template:
+        src: nginx.conf.j2
+        dest: /etc/nginx/nginx.conf
+        mode: "0644"
+        validate: nginx -t -q -c %s
+      register: _nginx
+    - name: nginx running
+      ansible.builtin.systemd_service:
+        name: nginx
+        enabled: true
+        state: "{{ 'restarted' if _nginx.changed else 'started' }}"
+
+# ---- DNS for the cluster domain ------------------------------------------------
+# Containers do not read /etc/hosts, so the service names must resolve through
+# DNS. CoreDNS forwards the domain here (hpc_coredns_forward_domain); node
+# resolvers can point here too. Sites with their own records set hpc_manage_dns=false.
+- name: dnsmasq
+  when: hpc_manage_dns | bool
+  block:
+    - name: Package
+      ansible.builtin.dnf:
+        name: dnsmasq
+        state: present
+    - name: Configuration
+      ansible.builtin.copy:
+        dest: /etc/dnsmasq.d/hpc.conf
+        mode: "0644"
+        content: |
+          # managed by ansible (hpc base)
+          listen-address=127.0.0.1,{{ hpc_admin_ip }}
+          bind-interfaces
+          no-resolv
+          domain-needed
+          bogus-priv
+          domain={{ hpc_domain }}
+          local=/{{ hpc_domain }}/
+          expand-hosts
+          # tenant applications: <app>.<namespace>.{{ hpc_apps_domain }} -> ingress on the admin node
+          address=/{{ hpc_apps_domain }}/{{ hpc_admin_ip }}
+    - name: dnsmasq running (restarted, since /etc/hosts is its zone data)
+      ansible.builtin.systemd_service:
+        name: dnsmasq
+        enabled: true
+        state: restarted
+      changed_when: false
+
+# ---- time source ------------------------------------------------------------------
+- name: Time source
+  when: hpc_manage_time | bool
+  block:
+    - name: chrony
+      ansible.builtin.dnf:
+        name: chrony
+        state: present
+    - name: chrony.conf
+      ansible.builtin.copy:
+        dest: /etc/chrony.conf
+        mode: "0644"
+        content: |
+          # managed by ansible (hpc base): the admin node is the cluster's time reference
+          {% for s in hpc_ntp_servers %}
+          server {{ s }} iburst
+          {% endfor %}
+          local stratum 10
+          {% for c in hpc_node_cidrs %}
+          allow {{ c }}
+          {% endfor %}
+          driftfile /var/lib/chrony/drift
+          makestep 1.0 3
+          rtcsync
+          logdir /var/log/chrony
+      register: _chrony
+    - name: chronyd running
+      ansible.builtin.systemd_service:
+        name: chronyd
+        enabled: true
+        state: "{{ 'restarted' if _chrony.changed else 'started' }}"

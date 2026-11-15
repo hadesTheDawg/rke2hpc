@@ -1,0 +1,8 @@
+# generated / local-only state
+.lab/
+.cache/
+secrets/
+config/site.local.env
+*.pyc
+__pycache__/
+.DS_Store

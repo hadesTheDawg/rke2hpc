@@ -1,0 +1,70 @@
+# ceph-csi-cephfs {{ hpc_ceph_csi_chart_version }}: every image from the system registry.
+csiConfig:
+{% if hpc_ceph_cluster_id %}
+  - clusterID: "{{ hpc_ceph_cluster_id }}"
+    monitors: {{ hpc_ceph_monitors | to_json }}
+    cephFS:
+      subvolumeGroup: "{{ hpc_ceph_subvolume_group }}"
+{% else %}
+  []
+{% endif %}
+nodeplugin:
+  # host network: the default metrics port 8081 is taken by canal's flanneld
+  httpMetrics:
+    containerPort: {{ hpc_ceph_nodeplugin_metrics_port }}
+  registrar:
+    image:
+      repository: {{ hpc_sysreg }}/sig-storage/csi-node-driver-registrar
+      tag: v2.18.0
+  plugin:
+    image:
+      repository: {{ hpc_sysreg }}/cephcsi/cephcsi
+      tag: v{{ hpc_ceph_csi_chart_version }}
+  # compute nodes mount the volumes; the admin node runs platform pods with PVCs too
+  tolerations: []
+{% if hpc_ceph_kernel_mount_options %}
+  kernelmountoptions: "{{ hpc_ceph_kernel_mount_options }}"
+{% endif %}
+provisioner:
+  replicaCount: {{ hpc_ceph_provisioner_replicas }}
+  nodeSelector:
+    hpc.io/role: admin
+  provisioner:
+    image:
+      repository: {{ hpc_sysreg }}/sig-storage/csi-provisioner
+      tag: v6.3.0
+  attacher:
+    image:
+      repository: {{ hpc_sysreg }}/sig-storage/csi-attacher
+      tag: v4.13.0
+  resizer:
+    image:
+      repository: {{ hpc_sysreg }}/sig-storage/csi-resizer
+      tag: v2.2.1
+  snapshotter:
+    image:
+      repository: {{ hpc_sysreg }}/sig-storage/csi-snapshotter
+      tag: v8.6.0
+{% if hpc_ceph_cluster_id and hpc_ceph_user_id %}
+secret:
+  create: true
+  name: csi-cephfs-secret
+  userID: "{{ hpc_ceph_user_id }}"
+  userKey: "{{ hpc_ceph_user_key }}"
+storageClass:
+  create: true
+  name: {{ hpc_ceph_storage_class }}
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "{{ (hpc_storage_backend == 'cephfs') | string | lower }}"
+  clusterID: "{{ hpc_ceph_cluster_id }}"
+  fsName: "{{ hpc_ceph_fs_name }}"
+  provisionerSecretNamespace: {{ hpc_ceph_namespace }}
+  controllerExpandSecretNamespace: {{ hpc_ceph_namespace }}
+  nodeStageSecretNamespace: {{ hpc_ceph_namespace }}
+  reclaimPolicy: Delete
+  allowVolumeExpansion: true
+volumeSnapshotClass:
+  create: true
+  clusterID: "{{ hpc_ceph_cluster_id }}"
+  snapshotterSecretNamespace: {{ hpc_ceph_namespace }}
+{% endif %}

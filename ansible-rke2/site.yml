@@ -1,0 +1,113 @@
+---
+# Full deployment, in order. Every play is idempotent; re-run the whole file or
+# pick parts with --tags (pki, bundle, base, registry, nfs, rke2, platform,
+# ceph, keycloak, rancher, identity, tenants, accounting).
+#   ansible-playbook -i inventories/<site>/hosts.yml site.yml
+# Switch a component off with hpc_enable_<name>: false (docs/variables.md).
+# To add a component: create roles/<name>, add a play below (docs/extending.md).
+
+- name: Preflight (facts, inventory and network checks)
+  hosts: rke2_servers:rke2_agents
+  gather_facts: true
+  become: false
+  tags: [always]
+  roles: [preflight]
+
+- name: PKI and credentials (on the deployer)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tags: [pki]
+  roles: [pki]
+
+- name: Offline bundle
+  hosts: rke2_servers
+  gather_facts: false
+  tags: [bundle]
+  roles:
+    - role: bundle
+      when: hpc_enable_bundle | bool
+
+- name: Baseline, admin node (repository server)
+  hosts: rke2_servers
+  gather_facts: false
+  become: true
+  tags: [base]
+  roles:
+    - role: base
+      when: hpc_enable_base | bool
+
+- name: Baseline, compute nodes
+  hosts: rke2_agents
+  gather_facts: false
+  become: true
+  tags: [base]
+  roles:
+    - role: base
+      when: hpc_enable_base | bool
+
+- name: Registries
+  hosts: rke2_servers
+  gather_facts: false
+  become: true
+  tags: [registry]
+  roles:
+    - role: registry
+      when: hpc_enable_registry | bool
+
+- name: NFS server
+  hosts: rke2_servers
+  gather_facts: false
+  become: true
+  tags: [nfs]
+  roles:
+    - role: nfs_server
+      when: hpc_enable_nfs_server | bool
+
+- name: RKE2 server
+  hosts: rke2_servers
+  gather_facts: false
+  become: true
+  tags: [rke2]
+  roles:
+    - role: rke2
+      when: hpc_enable_rke2 | bool
+
+- name: RKE2 agents
+  hosts: rke2_agents
+  gather_facts: false
+  become: true
+  tags: [rke2]
+  roles:
+    - role: rke2
+      when: hpc_enable_rke2 | bool
+
+- name: All nodes Ready
+  hosts: rke2_servers
+  gather_facts: false
+  become: true
+  tags: [rke2]
+  roles: [hpc_common]
+  tasks:
+    - name: Wait for every node
+      ansible.builtin.shell:
+        cmd: "{{ hpc_kubectl }} get nodes --no-headers | awk '$2==\"Ready\"' | wc -l"
+      register: _ready
+      until: _ready.stdout | int == hpc_cluster_hosts | length
+      retries: 120
+      delay: 5
+      changed_when: false
+      when: hpc_enable_rke2 | bool
+
+- name: Cluster platform, storage, identity, projects
+  hosts: rke2_servers
+  gather_facts: false
+  become: true
+  roles:
+    - {role: platform, when: hpc_enable_platform | bool, tags: [platform]}
+    - {role: ceph_csi, when: hpc_enable_ceph_csi | bool, tags: [ceph]}
+    - {role: keycloak, when: hpc_enable_keycloak | bool, tags: [keycloak]}
+    - {role: rancher, when: hpc_enable_rancher | bool, tags: [rancher]}
+    - {role: identity, when: hpc_enable_identity | bool, tags: [identity]}
+    - {role: tenants, when: hpc_enable_tenants | bool, tags: [tenants]}
+    - {role: accounting, when: hpc_enable_accounting | bool, tags: [accounting]}

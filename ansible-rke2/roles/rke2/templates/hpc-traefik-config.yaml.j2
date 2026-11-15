@@ -1,0 +1,10 @@
+# Tenant ingress is served only from the admin node.
+apiVersion: helm.cattle.io/v1
+kind: HelmChartConfig
+metadata:
+  name: rke2-traefik
+  namespace: kube-system
+spec:
+  valuesContent: |-
+    nodeSelector:
+      hpc.io/role: admin

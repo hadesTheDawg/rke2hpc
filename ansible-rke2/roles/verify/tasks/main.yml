@@ -1,0 +1,108 @@
+---
+# Acceptance checks, run from the admin node as real users would act
+# (Keycloak logins, kubectl with their tokens, Rancher through OIDC).
+# Needs hpc_keycloak_allow_password_grant=true and two project groups.
+- name: Projects from the flat file (on the deployer)
+  ansible.builtin.command:
+    argv: [python3, "{{ role_path }}/../tenants/files/hpc_flatfile.py", json, "{{ hpc_projects_file }}"]
+  register: _ff
+  changed_when: false
+  delegate_to: localhost
+  become: false
+
+- name: Test subjects (first user of the first two projects)
+  ansible.builtin.set_fact:
+    _a: "{{ (_ff.stdout | from_json).projects[0] }}"
+    _b: "{{ (_ff.stdout | from_json).projects[1] }}"
+    _admin_user: "{{ hpc_platform_admin_users[0] }}"
+
+- name: Their passwords
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: user-passwords
+  vars:
+    _users: ["{{ _a.users[0] }}", "{{ _b.users[0] }}", "{{ _admin_user }}"]
+
+- name: Verify scripts
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: /usr/local/libexec/hpc/verify/
+    mode: "0755"
+  loop: [lib.sh, infra.sh, tenants.sh, accounting.sh, rancher-oidc-login.py]
+
+- name: Check environment
+  ansible.builtin.set_fact:
+    _verify_env:
+      VERIFY_DIR: /usr/local/libexec/hpc/verify
+      HPC_HOSTS: "{% for h in hpc_cluster_hosts %}{{ h }} {{ hostvars[h].hpc_mgmt_ip }} {{ 'admin' if h == hpc_admin_host else 'compute' }}\n{% endfor %}"
+      NODE_NETS: "{% for h in hpc_cluster_hosts %}{{ h }} {{ 'admin' if h == hpc_admin_host else 'compute' }} {{ hostvars[h].hpc_mgmt_ip }} {{ hostvars[h].hpc_pod_ip }}\n{% endfor %}"
+      BLOCKED_IPS: "{{ ((hpc_compute_hosts[:1] | map('extract', hostvars, 'hpc_mgmt_ip') | list) + (hpc_compute_hosts[:1] | map('extract', hostvars, 'hpc_pod_ip') | list)) | unique | join(' ') }}"
+      ADMIN_NAME: "{{ hpc_admin_host }}"
+      ADMIN_IP: "{{ hpc_admin_ip }}"
+      OFFLINE: "{{ hpc_offline | string | lower }}"
+      CLUSTER_DOMAIN: "{{ hpc_domain }}"
+      REGISTRY_SYSTEM_HOST: "{{ hpc_registry_system_host }}"
+      REGISTRY_SYSTEM_PORT: "{{ hpc_registry_system_port }}"
+      REGISTRY_SYSTEM_RW_PORT: "{{ hpc_registry_system_rw_port }}"
+      REGISTRY_USER_HOST: "{{ hpc_registry_user_host }}"
+      REGISTRY_USER_PORT: "{{ hpc_registry_user_port }}"
+      REGISTRY_USER_RW_PORT: "{{ hpc_registry_user_rw_port }}"
+      PULL_PASSWORD: "{{ hpc_registry_pull_password }}"
+      STORAGE_CLASS: "{{ hpc_storage_class }}"
+      KEYCLOAK_HOST: "{{ hpc_keycloak_host }}"
+      KEYCLOAK_REALM: "{{ hpc_keycloak_realm }}"
+      KUBE_API_HOST: "{{ hpc_kube_api_host }}"
+      RANCHER_HOST: "{{ hpc_rancher_host }}"
+      RANCHER_ENABLED: "{{ hpc_enable_rancher | string | lower }}"
+      APPS_DOMAIN: "{{ hpc_apps_domain }}"
+      UNPINNED_NAMESPACES: "{{ hpc_unpinned_namespaces | join(' ') }}"
+      CEPH_ENABLED: "{{ hpc_enable_ceph_csi | string | lower }}"
+      CEPH_NS: "{{ hpc_ceph_namespace }}"
+      OIDC_GROUP_PREFIX: "{{ hpc_oidc_group_prefix }}"
+      TENANT_POD_SECURITY: "{{ hpc_tenant_pod_security }}"
+      UID_START: "{{ hpc_uid_start }}"
+      HOME_ROOT: "{{ hpc_home_root }}"
+      HOME_VOLUME: "{{ hpc_home_volume }}"
+      HOME_CREATE_ROOT: "{{ hpc_home_create_root }}"
+      USER_A: "{{ _a.users[0] }}"
+      GROUP_A: "{{ _a.group }}"
+      PW_A: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/users/' ~ _a.users[0], length=20, chars=hpc_secret_chars) }}"
+      USER_B: "{{ _b.users[0] }}"
+      GROUP_B: "{{ _b.group }}"
+      PW_B: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/users/' ~ _b.users[0], length=20, chars=hpc_secret_chars) }}"
+      ADMIN_USER: "{{ _admin_user }}"
+      ADMIN_PW: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/users/' ~ _admin_user, length=20, chars=hpc_secret_chars) }}"
+  no_log: true
+
+- name: Pod network runs over the pod interface
+  ansible.builtin.include_tasks: podnet.yml
+  when: hpc_compute_hosts | length >= 2
+
+- name: "Checks: {{ item }}"
+  ansible.builtin.shell:
+    cmd: ". /usr/local/libexec/hpc/verify/lib.sh; . /usr/local/libexec/hpc/verify/{{ item }}.sh"
+    executable: /bin/bash
+  environment: "{{ _verify_env }}"
+  loop: "{{ ['infra', 'tenants'] + (['accounting'] if hpc_enable_accounting else []) }}"
+  register: _checks
+  changed_when: false
+  failed_when: false
+
+- name: Results
+  ansible.builtin.debug:
+    msg: "{{ item.stdout_lines }}"
+  loop: "{{ _checks.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: All checks passed
+  ansible.builtin.assert:
+    that:
+      - _checks.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+      - _podnet_ok | default(true)
+    fail_msg: >-
+      failed: {{ _checks.results | rejectattr('rc', 'equalto', 0) | map(attribute='item') | list }}
+      {{ '' if _podnet_ok | default(true) else '+ pod network' }}
+    success_msg: >-
+      all acceptance checks passed
+      ({{ _checks.results | map(attribute='stdout') | map('regex_findall', '(?m)^    PASS ') | map('length') | sum + (_podnet_count | default(0)) }} checks)

@@ -1,0 +1,63 @@
+---
+# Runs on every cluster node first (facts are gathered by the play). Catches
+# inventory/network mistakes before anything is changed.
+- name: Exactly one RKE2 server (the admin node)
+  ansible.builtin.assert:
+    that: groups['rke2_servers'] | default([]) | length == 1
+    fail_msg: "inventory group rke2_servers must contain exactly one host (the admin node)"
+  run_once: true
+
+- name: Supported OS
+  ansible.builtin.assert:
+    that:
+      - ansible_facts.os_family == 'RedHat'
+      - ansible_facts.distribution_major_version | int == hpc_el_major | int
+      - (ansible_facts.architecture == hpc_rpm_arch)
+    fail_msg: >-
+      {{ inventory_hostname }} runs {{ ansible_facts.distribution }} {{ ansible_facts.distribution_version }}
+      {{ ansible_facts.architecture }}; expected EL{{ hpc_el_major }} {{ hpc_rpm_arch }} (hpc_arch={{ hpc_arch }})
+
+- name: Management interface has an IPv4 address
+  ansible.builtin.assert:
+    that: hpc_mgmt_ip is defined and hpc_mgmt_ip | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }}: no IPv4 address on management interface '{{ hpc_mgmt_iface }}'
+      (interfaces: {{ ansible_facts.interfaces | join(', ') }}). Set hpc_mgmt_iface or hpc_mgmt_ip.
+
+- name: Pod interface has an IPv4 address
+  ansible.builtin.assert:
+    that: hpc_pod_ip is defined and hpc_pod_ip | length > 0
+    fail_msg: >-
+      {{ inventory_hostname }}: no IPv4 address on pod interface '{{ hpc_pod_iface }}'
+      (interfaces: {{ ansible_facts.interfaces | join(', ') }}). Set hpc_pod_iface ('' = use management).
+  when: hpc_pod_iface | length > 0
+
+# Resolved once here and kept as facts, so later plays (and other hosts, via
+# hostvars) see each node's addresses.
+- name: Record this node's addresses
+  ansible.builtin.set_fact:
+    hpc_mgmt_ip: "{{ hpc_mgmt_ip }}"
+    hpc_pod_ip: "{{ hpc_pod_ip }}"
+
+- name: Networks
+  ansible.builtin.debug:
+    msg: "{{ inventory_hostname }}: management {{ hpc_mgmt_iface }} {{ hpc_mgmt_ip }}, pods {{ hpc_pod_iface or hpc_mgmt_iface }} {{ hpc_pod_ip }}"
+
+- name: Pod/service ranges do not overlap the node networks
+  ansible.builtin.command:
+    argv:
+      - python3
+      - -c
+      - |
+        import ipaddress, sys
+        nodes = [ipaddress.ip_network(c, strict=False) for c in sys.argv[1].split()]
+        for c in sys.argv[2].split():
+            k = ipaddress.ip_network(c)
+            bad = [str(n) for n in nodes if n.overlaps(k)]
+            if bad:
+                sys.exit("%s overlaps node network(s) %s" % (k, ", ".join(bad)))
+      - "{{ hpc_node_cidrs | join(' ') }}"
+      - "{{ hpc_cluster_cidr }} {{ hpc_service_cidr }}"
+  delegate_to: localhost
+  run_once: true
+  changed_when: false

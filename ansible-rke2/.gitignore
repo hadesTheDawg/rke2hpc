@@ -1,0 +1,4 @@
+# downloaded bundle (large) and per-site generated state
+.bundle/
+inventories/*/secrets/
+*.retry

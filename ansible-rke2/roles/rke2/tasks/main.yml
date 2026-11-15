@@ -1,0 +1,100 @@
+---
+# RKE2 from RPM (SELinux policy included). Server on the admin node, agents on
+# the compute nodes. Node IP = management address; pod overlay = hpc_pod_iface.
+- name: Role of this node
+  ansible.builtin.set_fact:
+    _rke2_server: "{{ inventory_hostname == hpc_admin_host }}"
+    _rke2_svc: "{{ 'rke2-server' if inventory_hostname == hpc_admin_host else 'rke2-agent' }}"
+
+- name: Packages
+  ansible.builtin.dnf:
+    name: ["{{ _rke2_svc }}", rke2-selinux, nfs-utils]
+    state: present
+
+- name: Pods may mount NFS volumes (SELinux)
+  ansible.builtin.shell:
+    cmd: |
+      if [ "$(getsebool virt_use_nfs | awk '{print $3}')" != on ]; then setsebool -P virt_use_nfs on; echo changed; fi
+  register: _sebool
+  changed_when: "'changed' in _sebool.stdout"
+
+- name: NetworkManager leaves the CNI interfaces alone
+  ansible.builtin.copy:
+    dest: /etc/NetworkManager/conf.d/rke2-canal.conf
+    mode: "0644"
+    content: |
+      [keyfile]
+      unmanaged-devices=interface-name:flannel*;interface-name:cali*;interface-name:tunl*;interface-name:vxlan.calico;interface-name:vxlan-v6.calico;interface-name:wireguard.cali;interface-name:wg-v6.cali
+  register: _nm
+
+- name: Reload NetworkManager
+  ansible.builtin.systemd_service:
+    name: NetworkManager
+    state: reloaded
+  when: _nm.changed
+
+- name: Configuration directory
+  ansible.builtin.file:
+    path: /etc/rancher/rke2
+    state: directory
+    mode: "0755"
+
+# Every image comes from the admin node. Unqualified / docker.io references try
+# the user registry first, then the system registry.
+- name: registries.yaml
+  ansible.builtin.template:
+    src: registries.yaml.j2
+    dest: /etc/rancher/rke2/registries.yaml
+    mode: "0600"
+  register: _reg
+
+- name: Server-side files
+  ansible.builtin.include_tasks: server-files.yml
+  when: _rke2_server
+
+- name: config.yaml
+  ansible.builtin.template:
+    src: "{{ 'config-server.yaml.j2' if _rke2_server else 'config-agent.yaml.j2' }}"
+    dest: /etc/rancher/rke2/config.yaml
+    mode: "0600"
+  register: _cfg
+
+- name: Is RKE2 running
+  ansible.builtin.command: "systemctl is-active {{ _rke2_svc }}"
+  register: _active
+  changed_when: false
+  failed_when: false
+
+- name: Start RKE2 (first start imports images; takes a few minutes)
+  ansible.builtin.systemd_service:
+    name: "{{ _rke2_svc }}"
+    enabled: true
+    state: "{{ 'restarted' if (_active.rc == 0 and (_reg.changed or _cfg.changed or (_server_cfg_changed | default(false)))) else 'started' }}"
+
+- name: Server is ready
+  when: _rke2_server
+  block:
+    - name: kube-apiserver answers
+      ansible.builtin.command: "{{ hpc_kubectl }} get --raw /readyz"
+      register: _readyz
+      until: _readyz.rc == 0
+      retries: 120
+      delay: 5
+      changed_when: false
+    - name: kubectl and helm for root
+      ansible.builtin.file:
+        src: /var/lib/rancher/rke2/bin/kubectl
+        dest: /usr/local/bin/kubectl
+        state: link
+    - name: helm
+      ansible.builtin.copy:
+        src: "{{ hpc_data_root }}/bundle/bin/helm"
+        dest: /usr/local/bin/helm
+        remote_src: true
+        mode: "0755"
+    - name: KUBECONFIG for root shells
+      ansible.builtin.copy:
+        dest: /etc/profile.d/hpc-kube.sh
+        mode: "0644"
+        content: |
+          [ "$(id -u)" = 0 ] && export KUBECONFIG=/etc/rancher/rke2/rke2.yaml

@@ -1,0 +1,14 @@
+---
+# Acceptance checks (needs hpc_keycloak_allow_password_grant=true):
+#   ansible-playbook -i inventories/<site>/hosts.yml verify.yml
+- name: Facts
+  hosts: rke2_servers:rke2_agents
+  gather_facts: true
+  become: false
+  roles: [preflight]
+
+- name: Acceptance checks
+  hosts: rke2_servers
+  gather_facts: false
+  become: true
+  roles: [verify]

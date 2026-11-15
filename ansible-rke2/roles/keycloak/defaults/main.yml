@@ -1,0 +1,1 @@
+hpc_keycloak_db_dir: /var/lib/hpc/keycloak-db   # PostgreSQL data, local disk of the admin node

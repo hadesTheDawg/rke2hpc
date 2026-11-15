@@ -1,0 +1,27 @@
+# A job to watch in the accounting.
+#
+#   On the login node, as a member of the project:
+#     kubectl create -f long-job.yaml           (namespace = your current context)
+#     kubectl get jobs,pods -L hpc.io/jobid
+#     kubectl get configmap project-usage -o yaml
+#   As admin, on the deployer:
+#     sudo hpc-acct jobs --active   (on the admin node)
+#
+# It asks for 1 CPU and sleeps for an hour, so it accrues 1 CPU-hour per hour.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: long-job-          # use `kubectl create -f` (not apply) with generateName
+spec:
+  backoffLimit: 0                  # do not retry on failure
+  # activeDeadlineSeconds: 1800    # optional: have Kubernetes stop it after 30 minutes (recorded as TIMEOUT)
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: main
+        image: busybox:1.37
+        command: [sh, -c, "echo started as $(id -u) in $HOME; sleep 3600"]
+        resources:
+          requests: {cpu: "1", memory: 256Mi}     # CPU-hours are counted on the CPU request
+          limits:   {cpu: "1", memory: 256Mi}

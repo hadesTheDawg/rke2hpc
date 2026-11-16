@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Copy the admin node's irreplaceable state to storage that outlives the node
+# (hpc_backup_dir, e.g. on CephFS). Runs from hpc-backup.timer and at the end of
+# every site.yml run. Restores are automatic (roles rke2 and accounting).
+#   <dir>/etcd/hpc-backup-<node>-<time>   etcd snapshot (cluster state + RKE2 CAs, token-encrypted)
+#   <dir>/acct/acct-<time>.db             accounting database (consistent SQLite copy)
+# Settings: /etc/hpc/backup.env (BACKUP_DIR, KEEP).
+set -euo pipefail
+. /etc/hpc/backup.env
+umask 077
+
+# The marker is written by ansible into the mounted filesystem: if the mount is
+# missing, fail instead of filling the local disk that a re-provision wipes.
+[ -f "$BACKUP_DIR/.hpc-backup" ] || { echo "hpc-backup: $BACKUP_DIR is not mounted (no .hpc-backup marker)" >&2; exit 1; }
+mkdir -p "$BACKUP_DIR/etcd" "$BACKUP_DIR/acct"
+stamp=$(date -u +%Y%m%dT%H%M%SZ)
+
+prune() { # keep the newest $KEEP files matching $2 in $1
+  find "$1" -maxdepth 1 -type f -name "$2" -printf '%T@ %p\n' | sort -rn | tail -n +"$((KEEP + 1))" | cut -d' ' -f2- | xargs -r rm -f
+}
+
+# ---- etcd: an on-demand snapshot, written by RKE2 to its local snapshot dir ----
+snapdir=/var/lib/rancher/rke2/server/db/snapshots
+# (RKE2 prunes these to etcd-snapshot-retention per name, like its scheduled ones)
+/usr/bin/rke2 etcd-snapshot save --name hpc-backup
+snap=$(find "$snapdir" -maxdepth 1 -type f -name 'hpc-backup-*' -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)
+[ -n "$snap" ] || { echo "hpc-backup: no snapshot in $snapdir" >&2; exit 1; }
+cp "$snap" "$BACKUP_DIR/etcd/.$(basename "$snap").part"
+sync -f "$BACKUP_DIR/etcd/.$(basename "$snap").part"
+mv "$BACKUP_DIR/etcd/.$(basename "$snap").part" "$BACKUP_DIR/etcd/$(basename "$snap")"
+prune "$BACKUP_DIR/etcd" 'hpc-backup-*'
+echo "etcd: $(basename "$snap") ($(du -h "$snap" | cut -f1))"
+
+# ---- accounting database ------------------------------------------------------
+db=/var/lib/hpc/acct/acct.db
+if [ -f "$db" ]; then
+  out="$BACKUP_DIR/acct/acct-$stamp.db"
+  python3 - "$db" "$out.part" <<'PY'
+import sqlite3, sys
+src = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True)
+dst = sqlite3.connect(sys.argv[2])
+src.backup(dst)
+dst.close(); src.close()
+PY
+  sync -f "$out.part"
+  mv "$out.part" "$out"
+  prune "$BACKUP_DIR/acct" 'acct-*.db'
+  echo "accounting: $(basename "$out")"
+fi

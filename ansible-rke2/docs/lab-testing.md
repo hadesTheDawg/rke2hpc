@@ -49,3 +49,24 @@ location: with the `cpu_hours` `Field` line commented out and the column
 removed from `projects.txt`, `tenants.yml` applied cleanly, every project
 reported against the default allocation (1000 CPU-hours) and the CPU, memory
 and storage quotas were unchanged.
+
+## Re-provisioning test (2026-11-15)
+
+`lab.sh reprovision <node>` wipes a node's root disk and boots it with a new
+cloud-init instance. The admin VM's second disk, mounted at
+`/rhev/data-center/mnt/cephfs`, stands in for the site's CephFS and is kept
+([reprovisioning.md](reprovisioning.md)). Production defaults: no homes,
+`hpc_pod_identity: name`.
+
+| Step | Result |
+|------|--------|
+| fresh lab, `site.yml`, `verify.yml` | 99 checks passed |
+| `reprovision c2`, `site.yml`, `verify.yml` | 99 passed; c2 rejoined under its old name (fixed node password) |
+| `reprovision a1` with no snapshot while c1-c3 still belong to the cluster | `site.yml` stops before RKE2 starts, with the "Refuse to start a second cluster" message |
+| `reprovision a1`, `site.yml`, `verify.yml` | etcd restored from the newest snapshot, compute nodes refreshed, accounting history restored: 101 checks passed, no manual step |
+| `site.yml` + `verify.yml` with `-e @inventories/lab/group_vars/all.yml-with-user-home.example` | uid/gid + NFS homes on the persistent storage: 106 checks passed |
+
+Found on the way: right after an etcd restore, watchers on the compute nodes
+(Calico, a CoreDNS replica) kept the pre-restore view and missed new objects.
+New Services did not resolve and network policy was stale until they
+restarted. The restore now recreates those pods.

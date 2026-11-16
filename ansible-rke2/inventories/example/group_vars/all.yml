@@ -32,12 +32,20 @@ hpc_enable_ceph_csi: false         # true to install the CephFS driver
 # hpc_ceph_fs_name: cephfs
 # hpc_ceph_user_id: k8s
 # hpc_ceph_user_key: "{{ vault_ceph_user_key }}"
-# Homes mounted into pods (NFS). Point at an external server if homes live elsewhere:
-# hpc_home_nfs_server: 172.16.0.20
-# hpc_home_nfs_path: /export/home
-# hpc_home_create_root: ""          # homes are created by the site, not by hpc-sync
-# hpc_home_volume: none             # do not mount homes into pods
+
+# ---- pod identity -------------------------------------------------------------------
+# Project pods always carry their submitter's unix name (label + annotation
+# hpc.io/user). No uid/gid is set and no home is mounted. To run pods as the
+# user's uid/gid with their NFS home, use all.yml-with-user-home.example.
+hpc_pod_identity: name             # name | uid
+hpc_home_volume: none              # none | nfs (nfs needs hpc_pod_identity: uid)
 
 # ---- identity --------------------------------------------------------------------
 hpc_platform_admin_users: [opsadmin]
 hpc_keycloak_allow_password_grant: false   # true only while running verify.yml
+
+# Nodes the cluster manager can re-provision (wipe): keep the admin node's
+# state on storage that outlives it, e.g. the CephFS mount the nodes get at
+# boot. Exports, Keycloak DB and hourly etcd/accounting backups go there, and
+# a wiped admin node is restored by re-running site.yml (docs/reprovisioning.md).
+# hpc_persist_root: /rhev/data-center/mnt/cephfs/rke2

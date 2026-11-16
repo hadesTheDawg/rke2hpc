@@ -36,6 +36,7 @@ hpc_enable_rancher: true
 hpc_enable_identity: true      # Keycloak realm/clients, Rancher login
 hpc_enable_tenants: true       # the flat file
 hpc_enable_accounting: true    # job accounting (measures only)
+hpc_enable_backup: "{{ hpc_backup_dir | length > 0 }}"   # etcd + accounting backups of the admin node
 
 # =============================================================================
 # Site identity and platform
@@ -124,17 +125,33 @@ hpc_ntp_servers: []            # upstream NTP for the admin node, if the site ha
 # =============================================================================
 # Storage
 # =============================================================================
-hpc_data_root: /srv/hpc        # admin node: bundle, registries, repo
+hpc_data_root: /srv/hpc        # admin node: bundle, registries, repo (all rebuilt from the bundle)
 hpc_home_root: /c/home         # home directories are <home root>/<user> (inside pods too)
-hpc_nfs_home_export: /c/home   # exported from the admin node (when hpc_enable_nfs_server)
-hpc_nfs_k8s_export: /c/k8s     # backs the NFS StorageClass
+# ---- surviving a re-provisioned admin node (docs/reprovisioning.md) -----------
+# A directory on storage that outlives the admin node's local disk (e.g. a
+# CephFS mount). When set, everything that cannot be rebuilt lives there or is
+# backed up there: NFS exports, the Keycloak database, etcd snapshots and the
+# accounting database. '' = all of it stays on the admin node's local disk.
+hpc_persist_root: ""
+hpc_persist_require_mount: true   # preflight: hpc_persist_root must not be on the root filesystem
+hpc_backup_dir: "{{ (hpc_persist_root ~ '/backup') if hpc_persist_root else '' }}"
+hpc_backup_schedule: hourly       # systemd OnCalendar of the server state backup
+hpc_backup_keep: 48               # backups of each kind kept in hpc_backup_dir
+hpc_rke2_restore: true            # re-provisioned admin node (no etcd): restore the newest snapshot
+hpc_nfs_home_export: "{{ (hpc_persist_root ~ '/home') if hpc_persist_root else '/c/home' }}"   # exported from the admin node (when hpc_enable_nfs_server)
+hpc_nfs_k8s_export: "{{ (hpc_persist_root ~ '/k8s') if hpc_persist_root else '/c/k8s' }}"      # backs the NFS StorageClass
+# Give each export a fixed fsid. Required when the exports are on CephFS or
+# another network filesystem (they have no device number nfsd can use).
+hpc_nfs_export_fsid: "{{ hpc_persist_root | length > 0 }}"
 hpc_nfs_home_extra_clients: [] # more addresses/CIDRs allowed to mount the homes (e.g. login nodes)
-# Home directory mounted into every project pod: nfs | none
-hpc_home_volume: nfs
+# Home directory mounted into every project pod: none | nfs. nfs needs
+# hpc_pod_identity: uid. inventories/example/group_vars/all.yml-with-user-home.example
+# has the settings that turn homes on.
+hpc_home_volume: none
 hpc_home_nfs_server: "{{ hpc_admin_ip }}"
 hpc_home_nfs_path: "{{ hpc_nfs_home_export }}"
-# Directory where hpc-sync creates new homes on the admin node ('' = homes are made elsewhere)
-hpc_home_create_root: "{{ hpc_nfs_home_export if hpc_enable_nfs_server else '' }}"
+# Directory where hpc-sync creates new homes on the admin node ('' = no homes are made here)
+hpc_home_create_root: "{{ hpc_nfs_home_export if (hpc_enable_nfs_server and hpc_home_volume == 'nfs') else '' }}"
 # Default StorageClass for volume claims: nfs | cephfs | none
 hpc_storage_backend: nfs
 hpc_storage_class: "{{ {'nfs': 'nfs', 'cephfs': hpc_ceph_storage_class, 'none': ''}[hpc_storage_backend] }}"
@@ -156,6 +173,12 @@ hpc_ceph_nodeplugin_metrics_port: 9481   # host port on every node (8081 is cana
 # Identity and tenancy
 # =============================================================================
 hpc_keycloak_realm: hpc
+# Every project pod carries its submitter's unix name (annotation and label
+# hpc.io/user). What else it gets:
+#   name  nothing more: containers run as the image's user (no uid/gid is set)
+#   uid   also runs as the submitter's uid, the common primary gid and the
+#         project gid (from the stable map in secrets/state/idmap.json)
+hpc_pod_identity: name
 hpc_uid_start: 5001
 hpc_gid_start: 6001
 hpc_platform_admin_group: hpc-admins       # Keycloak group -> cluster-admin + Rancher admin
@@ -192,6 +215,10 @@ hpc_registry_push_password: "{{ lookup('ansible.builtin.password', hpc_secrets_d
 hpc_registry_http_secret: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/registry-http-secret', length=32, chars=hpc_secret_chars) }}"
 hpc_rke2_server_token: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/rke2-server-token', length=32, chars=hpc_secret_chars) }}"
 hpc_rke2_agent_token: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/rke2-agent-token', length=32, chars=hpc_secret_chars) }}"
+# Each node's RKE2 node password is derived from this seed and its name, so a
+# re-provisioned node presents the same password and the server accepts it.
+hpc_rke2_node_password_seed: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/rke2-node-password-seed', length=48, chars=hpc_secret_chars) }}"
+hpc_rke2_node_password: "{{ (hpc_rke2_node_password_seed ~ ':' ~ inventory_hostname) | hash('sha256') }}"
 hpc_keycloak_admin_password: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/keycloak-admin', length=32, chars=hpc_secret_chars) }}"
 hpc_keycloak_db_password: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/keycloak-db', length=32, chars=hpc_secret_chars) }}"
 hpc_rancher_admin_password: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/rancher-admin', length=32, chars=hpc_secret_chars) }}"
@@ -228,6 +255,7 @@ hpc_sync_env:
   POD_CIDR: "{{ hpc_cluster_cidr }}"
   REGISTRY_USER_PORT: "{{ hpc_registry_user_port }}"
   HOME_ROOT: "{{ hpc_home_root }}"
+  POD_IDENTITY: "{{ hpc_pod_identity }}"
   HOME_VOLUME: "{{ hpc_home_volume }}"
   HOME_NFS_SERVER: "{{ hpc_home_nfs_server }}"
   HOME_NFS_PATH: "{{ hpc_home_nfs_path }}"

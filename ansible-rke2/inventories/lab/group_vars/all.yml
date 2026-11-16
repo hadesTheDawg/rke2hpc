@@ -5,3 +5,7 @@ hpc_pod_iface: hsn0             # 10.20.0.0/24: all pod-to-pod traffic
 # No Ceph in the lab: install the driver anyway to prove every image it needs is
 # in the registry (no StorageClass without hpc_ceph_cluster_id).
 hpc_enable_ceph_csi: true
+# The admin node's state lives on / is backed up to the lab's stand-in for the
+# site CephFS mount (a disk that `lab.sh reprovision a1` keeps), so wiping a1
+# and re-running site.yml brings the cluster back (docs/reprovisioning.md).
+hpc_persist_root: /rhev/data-center/mnt/cephfs/hpc

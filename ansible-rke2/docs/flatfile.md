@@ -106,7 +106,7 @@ After editing it, run `tenants.yml` (it installs the new version to
   (`/var/lib/hpc/idmap.json` on the admin node, backed up to
   `inventories/<site>/secrets/state/idmap.json` and restored from there if
   the admin node is rebuilt)
-- home directories `<hpc_home_root>/<user>` on the NFS export, mode 700
+- home directories `<hpc_home_root>/<user>` on the NFS export, mode 700 (only with `hpc_home_volume: nfs`)
 - per group: namespace pinned to compute nodes, ResourceQuota, LimitRange,
   NetworkPolicy, RBAC, Rancher project, Keycloak group; per user: Keycloak
   account with the initial password `inventories/<site>/secrets/users/<user>`

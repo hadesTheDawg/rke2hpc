@@ -113,10 +113,16 @@ if [ "$HOME_VOLUME" = nfs ]; then
   out=$(podlog id1 '{}' 'id -u; id -G; echo $HOME; touch $HOME/verify-pod && echo wrote' | tr '\n' ' ')
   t  "pod runs as its submitter: uid $UID_A, project gid $GID_A, home mounted ($out)" sh -c "case '$out' in '$UID_A '*' $GID_A $HOME_A wrote '|'$UID_A '*' $GID_A '*' $HOME_A wrote ') ;; *) exit 1 ;; esac"
   [ -n "$SRC_A" ] && t "file written by the pod is owned by uid $UID_A on the NFS export" test "$(owner_of verify-pod)" = "$UID_A"
-else
+elif [ "$POD_IDENTITY" = uid ]; then
   out=$(podlog id1 '{}' 'id -u; id -G' | tr '\n' ' ')
   t  "pod runs as its submitter: uid $UID_A, project gid $GID_A ($out)" sh -c "case '$out' in '$UID_A '*' $GID_A '|'$UID_A '*' $GID_A '*) ;; *) exit 1 ;; esac"
+else
+  out=$(podlog id1 '{}' 'id -u' | tr '\n' ' ')
+  t  "pod runs as the image's user, no uid/gid set (uid $out, runAsUser '$(ka get pod id1 -o jsonpath='{.spec.securityContext.runAsUser}')')" \
+     test -z "$(ka get pod id1 -o jsonpath='{.spec.securityContext.runAsUser}{.spec.securityContext.runAsGroup}')"
 fi
+who=$(ka get pod id1 -o jsonpath='{.metadata.labels.hpc\.io/user} {.metadata.annotations.hpc\.io/user}')
+t  "pod carries its submitter's unix name as label and annotation ($who)" test "$who" = "$USER_A $USER_A"
 spec=$(ka get pod id1 -o json | jq -c '[.spec.securityContext.seccompProfile.type, .spec.containers[0].securityContext.allowPrivilegeEscalation, .spec.containers[0].securityContext.capabilities.drop[0]]')
 t  "hardening defaults are filled in ($spec)"             test "$spec" = '["RuntimeDefault",false,"ALL"]'
 if [ "$HOME_VOLUME" = nfs ] && [ -n "$SRC_A" ]; then
@@ -130,8 +136,17 @@ if [ "$HOME_VOLUME" = nfs ] && [ -n "$SRC_A" ]; then
   ka rollout status deploy/owner-d --timeout=120s >/dev/null 2>&1
   t  "pods created by a Deployment run as the submitter and write to their home" test "$(cat "$SRC_A/verify-svc" 2>/dev/null)" = "$UID_A"
 fi
-out=$(podlog id3 "{\"metadata\":{\"annotations\":{\"hpc.io/user\":\"$USER_B\"}}}" 'id -u' | tr '\n' ' ')
-t  "claiming to be another user is ignored ($out)"        test "$out" = "$UID_A "
+out=$(podlog id3 "{\"metadata\":{\"annotations\":{\"hpc.io/user\":\"$USER_B\"},\"labels\":{\"hpc.io/user\":\"$USER_B\"}}}" 'id -u' | tr '\n' ' ')
+who=$(ka get pod id3 -o jsonpath='{.metadata.labels.hpc\.io/user} {.metadata.annotations.hpc\.io/user}')
+t  "claiming to be $USER_B (label + annotation) is overwritten ($who)" test "$who" = "$USER_A $USER_A"
+[ "$POD_IDENTITY" = uid ] && t "claiming to be another user does not change the uid ($out)" test "$out" = "$UID_A "
+if [ "$HOME_VOLUME" != nfs ]; then
+  printf 'apiVersion: batch/v1\nkind: Job\nmetadata: {name: owner}\nspec:\n  activeDeadlineSeconds: 120\n  template:\n    spec:\n      restartPolicy: Never\n      containers:\n      - {name: main, image: "busybox:1.37", command: ["true"]}\n' >"$W/owner.yaml"
+  ka apply -f "$W/owner.yaml" >/dev/null 2>&1
+  ka wait --for=condition=Complete job/owner --timeout=120s >/dev/null 2>&1
+  who=$(ka get pods -l job-name=owner -o jsonpath='{.items[0].metadata.labels.hpc\.io/user}' 2>/dev/null)
+  t  "pods created by a Job carry the submitter's unix name ($who)" test "$who" = "$USER_A"
+fi
 tm "inline NFS volumes are rejected"                       "project pods may only use" \
    ka run nfs1 --image=busybox:1.37 --restart=Never --overrides="{\"spec\":{\"activeDeadlineSeconds\":300,\"volumes\":[{\"name\":\"x\",\"nfs\":{\"server\":\"$ADMIN_IP\",\"path\":\"/c/k8s\"}}]}}" -- true
 
@@ -190,8 +205,13 @@ if [ -n "$RA" ]; then
   tm "$USER_A sees the project's workloads through Rancher" '"name": "web"' rget "$RA" "/k8s/clusters/local/apis/batch/v1/namespaces/$NS_A/jobs/web"
   curl -fsS -m 30 -H "Authorization: Bearer $RA" -H 'Content-Type: application/json' "https://$RANCHER_HOST/k8s/clusters/local/api/v1/namespaces/$NS_A/pods" \
     -d '{"apiVersion":"v1","kind":"Pod","metadata":{"name":"viarancher"},"spec":{"restartPolicy":"Never","activeDeadlineSeconds":120,"containers":[{"name":"c","image":"busybox:1.37","command":["true"]}]}}' >/dev/null 2>&1
-  got=$(ka get pod viarancher -o jsonpath='{.spec.securityContext.runAsUser}' 2>/dev/null)
-  t  "a pod created through Rancher also runs as $USER_A ($got)" test "$got" = "$UID_A"
+  if [ "$POD_IDENTITY" = uid ]; then
+    got=$(ka get pod viarancher -o jsonpath='{.spec.securityContext.runAsUser}' 2>/dev/null)
+    t  "a pod created through Rancher also runs as $USER_A ($got)" test "$got" = "$UID_A"
+  else
+    got=$(ka get pod viarancher -o jsonpath='{.metadata.labels.hpc\.io/user}' 2>/dev/null)
+    t  "a pod created through Rancher also carries the unix name $USER_A ($got)" test "$got" = "$USER_A"
+  fi
   tn "$USER_A cannot read $NS_B through Rancher"           rget "$RA" "/k8s/clusters/local/api/v1/namespaces/$NS_B/pods"
   tn "$USER_A cannot create namespaces through Rancher"    curl -fsS -m 30 -H "Authorization: Bearer $RA" -H 'Content-Type: application/json' -d '{"apiVersion":"v1","kind":"Namespace","metadata":{"name":"escape"}}' "https://$RANCHER_HOST/k8s/clusters/local/api/v1/namespaces"
 else

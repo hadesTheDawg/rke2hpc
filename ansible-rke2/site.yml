@@ -1,7 +1,7 @@
 ---
 # Full deployment, in order. Every play is idempotent; re-run the whole file or
 # pick parts with --tags (pki, bundle, base, registry, nfs, rke2, platform,
-# ceph, keycloak, rancher, identity, tenants, accounting).
+# ceph, keycloak, rancher, identity, tenants, accounting, backup).
 #   ansible-playbook -i inventories/<site>/hosts.yml site.yml
 # Switch a component off with hpc_enable_<name>: false (docs/variables.md).
 # To add a component: create roles/<name>, add a play below (docs/extending.md).
@@ -111,3 +111,4 @@
     - {role: identity, when: hpc_enable_identity | bool, tags: [identity]}
     - {role: tenants, when: hpc_enable_tenants | bool, tags: [tenants]}
     - {role: accounting, when: hpc_enable_accounting | bool, tags: [accounting]}
+    - {role: backup, when: hpc_enable_backup | bool, tags: [backup]}

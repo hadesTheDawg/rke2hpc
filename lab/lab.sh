@@ -4,6 +4,8 @@
 #   - the login node additionally has a NAT uplink (internet + ssh port-forward)
 #   - admin and compute nodes have NO route to the internet
 # Usage: lab/lab.sh up | down | destroy | status | ssh <host> [cmd] | console <host>
+#        lab/lab.sh reprovision <host>   wipe a node's disk and boot it fresh, like HPCM
+#                                        re-provisioning it (the admin node's persistent disk is kept)
 . "$(cd "$(dirname "$0")/.." && pwd)/lib/common.sh"
 . "$HPC_ROOT/lab/lab.env"
 
@@ -93,6 +95,15 @@ users:
       - $(cat "$LAB_DIR/id_ed25519.pub")
 growpart: {mode: auto, devices: ["/"]}
 USER
+  if [ "$role" = admin ]; then # persistent disk (vdc): formatted once, kept across reprovision
+    cat >>"$d/seed/user-data" <<USER
+# (not fs_setup: with partition none it runs mkfs -f even on an existing filesystem)
+bootcmd:
+  - [sh, -c, "blkid /dev/vdc >/dev/null || mkfs.xfs -L hpcpersist /dev/vdc"]
+mounts:
+  - [/dev/vdc, $LAB_PERSIST_MOUNT, xfs, "defaults,nofail", "0", "2"]
+USER
+  fi
   {
     echo "version: 2"
     echo "ethernets:"
@@ -136,12 +147,16 @@ start_vm() {
     qemu-img create -q -f qcow2 -F qcow2 -b "$BASE_IMG" "$d/disk.qcow2" "$(size_of "$h" 4)G"
     make_seed "$h"
   fi
+  if [ "$role" = admin ] && [ ! -f "$d/persist.qcow2" ]; then
+    qemu-img create -q -f qcow2 "$d/persist.qcow2" "${LAB_PERSIST_GB}G"
+  fi
   set -- -name "$h" -machine virt,accel=hvf -cpu host \
     -smp "$(size_of "$h" 2)" -m "$(size_of "$h" 3)" -bios "$FIRMWARE" \
     -drive "if=virtio,file=$d/disk.qcow2,format=qcow2,discard=unmap" \
     -drive "if=virtio,file=$d/seed.iso,format=raw,readonly=on" \
     -device virtio-rng-pci -display none -serial "file:$d/console.log" \
     -monitor "unix:$d/monitor.sock,server,nowait" -pidfile "$d/pid" -daemonize
+  [ "$role" = admin ] && set -- "$@" -drive "if=virtio,file=$d/persist.qcow2,format=qcow2,discard=unmap"
   if [ "$role" = login ]; then
     set -- "$@" -device virtio-net-pci,netdev=wan,mac=52:54:00:99:00:01 \
       -netdev "user,id=wan,hostfwd=tcp:127.0.0.1:$LAB_SSH_PORT-:22"
@@ -196,6 +211,24 @@ cmd_destroy() {
   info "lab VMs and disks removed (ssh key, base image and bundle cache kept)"
 }
 
+cmd_reprovision() { # new root disk + new cloud-init instance; persist.qcow2 survives
+  local h="$1" d="$LAB_DIR/$1" pid
+  [ -n "$(host_role "$h")" ] || die "unknown host $h"
+  [ "$(host_role "$h")" != login ] || die "$h is the jump host; reprovision cluster nodes only"
+  ensure_prereqs; write_ssh_config; start_switch
+  step "re-provisioning $h (root disk wiped)"
+  if is_up "$h"; then pid=$(cat "$d/pid"); kill "$pid" 2>/dev/null || true
+    while kill -0 "$pid" 2>/dev/null; do sleep 1; done; fi
+  rm -rf "$d/disk.qcow2" "$d/seed" "$d/seed.iso" "$d/console.log" "$d/pid"
+  ssh-keygen -q -R "$h" -f "$LAB_DIR/known_hosts" >/dev/null 2>&1 || true
+  ssh-keygen -q -R "$(host_ip "$h")" -f "$LAB_DIR/known_hosts" >/dev/null 2>&1 || true
+  rm -f /tmp/hpc-lab-* 2>/dev/null || true
+  start_vm "$h"
+  wait_for "ssh on $h" 300 hssh -o ConnectTimeout=5 "$h" true
+  hssh "$h" 'sudo -n cloud-init status --wait >/dev/null 2>&1 || true'
+  ok "$h is back with a fresh OS"
+}
+
 cmd_status() {
   local h
   for h in $(all_hosts); do
@@ -209,7 +242,8 @@ case "${1:-}" in
   down) cmd_down ;;
   destroy) cmd_destroy ;;
   status) cmd_status ;;
+  reprovision) [ $# -eq 2 ] || die "usage: lab.sh reprovision <host>"; cmd_reprovision "$2" ;;
   ssh) shift; [ $# -ge 1 ] || die "usage: lab.sh ssh <host> [command]"; exec ssh -F "$SSH_CONFIG" "$@" ;;
   console) [ $# -eq 2 ] || die "usage: lab.sh console <host>"; exec tail -n 50 -f "$LAB_DIR/$2/console.log" ;;
-  *) die "usage: lab.sh up | down | destroy | status | ssh <host> [cmd] | console <host>" ;;
+  *) die "usage: lab.sh up | down | destroy | status | reprovision <host> | ssh <host> [cmd] | console <host>" ;;
 esac

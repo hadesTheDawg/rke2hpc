@@ -558,6 +558,7 @@ def cluster_policies():
 
 IDENTITY_CM = {"name": "hpc-identities", "namespace": "kube-system"}
 OWNER_ANNOTATION = "hpc.io/user"
+OWNER_LABEL = "hpc.io/user"      # the same unix name, as a label (kubectl get pods -l hpc.io/user=<name>)
 
 # CEL shared by the policies below. `params` is the hpc-identities ConfigMap:
 #   u.<unix name> = uid      k.<keycloak user id> = unix name
@@ -583,10 +584,14 @@ CEL_VARS = [
 def pod_default_policies():
     """Mutating admission for project namespaces:
        - every pod gets the baseline-hardening fields users tend to leave out
-       - a pod is owned by the person who submitted it (directly or via a workload);
-         it runs as that person's uid/gid unless it names a user itself, and their
-         home directory is mounted at the same path as on the login node."""
+       - a pod is owned by the person who submitted it (directly or via a workload) and
+         always carries their unix name (annotation + label hpc.io/user)
+       - POD_IDENTITY=uid: it also runs as that person's uid/gid unless it names a user
+         itself (POD_IDENTITY=name: the image's user, no uid/gid is set)
+       - HOME_VOLUME=nfs (needs uid): their home directory is mounted at the same path
+         as on the login node."""
     sel = {"matchLabels": {"hpc.io/tenant": "true"}}
+    set_uid = "true" if E.get("POD_IDENTITY", "name") == "uid" else "false"
     home = "'%s/' + variables.owner" % E["HOME_ROOT"]                   # path inside the pod
     home_src = "'%s/' + variables.owner" % E["HOME_NFS_PATH"]           # path on the NFS server
     with_home = "variables.known" if E.get("HOME_VOLUME", "nfs") == "nfs" else "false"
@@ -601,7 +606,7 @@ def pod_default_policies():
             "object.spec.containers + (has(object.spec.initContainers) ? object.spec.initContainers : [])"},
         # the pod chose its own user somewhere -> leave identity alone
         {"name": "setuid", "expression":
-            "variables.known && !(has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser)) && "
+            set_uid + " && variables.known && !(has(object.spec.securityContext) && has(object.spec.securityContext.runAsUser)) && "
             "!variables.all.exists(c, has(c.securityContext) && has(c.securityContext.runAsUser))"},
         {"name": "gkey", "expression": "'g.' + namespaceObject.metadata.name"},
     ]
@@ -622,7 +627,9 @@ def pod_default_policies():
 
     pod_expr = (
         "Object{"
-        "?metadata: variables.human ? optional.of(Object.metadata{annotations: {'%(a)s': variables.submitter}}) : optional.none(), "
+        # label only for project users: their unix names are valid label values
+        "?metadata: variables.owner != '' ? optional.of(Object.metadata{annotations: {'%(a)s': variables.owner}, "
+        "?labels: variables.known ? optional.of({'%(l)s': variables.owner}) : optional.none()}) : optional.none(), "
         "spec: Object.spec{"
         "containers: object.spec.containers.map(c, %(c)s), "
         "?initContainers: has(object.spec.initContainers) ? optional.of(object.spec.initContainers.map(c, %(i)s)) : optional.none(), "
@@ -634,7 +641,7 @@ def pod_default_policies():
         "? object.spec.securityContext.seccompProfile.type : 'RuntimeDefault'}, "
         "?runAsUser: variables.setuid ? optional.of(int(params.data['u.' + variables.owner])) : optional.none(), "
         "?runAsGroup: variables.setuid ? optional.of(int(params.data['primary'])) : optional.none()}}}"
-    ) % {"a": OWNER_ANNOTATION, "c": container("containers"), "i": container("initContainers"),
+    ) % {"a": OWNER_ANNOTATION, "l": OWNER_LABEL, "c": container("containers"), "i": container("initContainers"),
          "srv": E["HOME_NFS_SERVER"], "home": home, "home_src": home_src, "with_home": with_home}
 
     def drop_caps(kind):
@@ -652,7 +659,7 @@ def pod_default_policies():
     lists_expr = (
         "%s + %s + "
         # the project group, when the pod runs as its owner
-        "(variables.known && variables.gkey in params.data && has(object.spec.securityContext.runAsUser) && "
+        "(" + set_uid + " && variables.known && variables.gkey in params.data && has(object.spec.securityContext.runAsUser) && "
         "object.spec.securityContext.runAsUser == int(params.data['u.' + variables.owner]) && "
         "!has(object.spec.securityContext.supplementalGroups) "
         "? [JSONPatch{op: 'add', path: '/spec/securityContext/supplementalGroups', "
@@ -715,6 +722,9 @@ def pod_default_policies():
                       {"expression": "variables.owner == '' || variables.trusted || "
                                      "(variables.human && variables.owner == variables.submitter)",
                        "message": "the %s annotation is set by the platform" % OWNER_ANNOTATION},
+                      {"expression": "!(has(object.metadata.labels) && '%s' in object.metadata.labels) || "
+                                     "object.metadata.labels['%s'] == variables.owner" % (OWNER_LABEL, OWNER_LABEL),
+                       "message": "the %s label is set by the platform" % OWNER_LABEL},
                       {"expression":
                           "!has(object.spec.volumes) || object.spec.volumes.all(v, %s || "
                           "(v.name == 'hpc-home' && has(v.nfs) && variables.owner != '' && v.nfs.server == '%s' "

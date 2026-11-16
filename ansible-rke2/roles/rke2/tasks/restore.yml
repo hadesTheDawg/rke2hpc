@@ -1,0 +1,83 @@
+---
+# The admin node came back without its etcd (HPCM re-provisioned it) while
+# hpc_backup_dir still holds snapshots of the cluster: restore the newest one
+# before RKE2 starts, so the cluster comes back with everything it had.
+# Snapshots carry RKE2's own CAs and keys, encrypted with the server token from
+# secrets/, so the restored server has the same identity and agents reconnect.
+- name: Local etcd data
+  ansible.builtin.stat:
+    path: /var/lib/rancher/rke2/server/db/etcd
+  register: _etcd
+
+- name: Snapshots in the backup directory
+  ansible.builtin.find:
+    paths: "{{ hpc_backup_dir }}/etcd"
+    patterns: "hpc-backup-*"
+    file_type: file
+  register: _snaps
+  when: not _etcd.stat.exists
+
+- name: Restore
+  when: not _etcd.stat.exists and (_snaps.files | default([]) | length > 0)
+  vars:
+    _snap: "{{ (_snaps.files | sort(attribute='mtime') | last).path }}"
+    _local: "/var/lib/rancher/rke2/server/db/snapshots/{{ _snap | basename }}"
+  block:
+    - name: Restoring from
+      ansible.builtin.debug:
+        msg: "{{ inventory_hostname }} has no etcd data: restoring {{ _snap }}"
+
+    - name: Snapshot directory
+      ansible.builtin.file:
+        path: /var/lib/rancher/rke2/server/db/snapshots
+        state: directory
+        mode: "0700"
+
+    # restore from local disk: rke2 runs SELinux-confined and may not read the backup mount
+    - name: Copy the snapshot to local disk
+      ansible.builtin.copy:
+        src: "{{ _snap }}"
+        dest: "{{ _local }}"
+        remote_src: true
+        mode: "0600"
+
+    - name: Cluster reset from the snapshot (starts etcd once, then exits)
+      ansible.builtin.command:
+        argv: [timeout, "1200", /usr/bin/rke2, server, --cluster-reset, "--cluster-reset-restore-path={{ _local }}"]
+      register: _reset
+      changed_when: true
+      failed_when: >-
+        _reset.rc != 0 and
+        'restart without --cluster-reset' not in (_reset.stdout ~ _reset.stderr)
+
+    - name: etcd data restored
+      ansible.builtin.stat:
+        path: /var/lib/rancher/rke2/server/db/etcd
+      register: _etcd_after
+      failed_when: not _etcd_after.stat.exists
+
+    - name: Remember the restore (agents' watchers are refreshed once the server is up)
+      ansible.builtin.set_fact:
+        _rke2_restored: true
+
+# No etcd and nothing to restore. If the agents still belong to the old cluster,
+# starting the server would create a new cluster they reject (unknown CA), so
+# stop here. hpc_rke2_restore: false skips this check and starts a new cluster.
+- name: Agents that belong to an existing cluster
+  ansible.builtin.stat:
+    path: /var/lib/rancher/rke2/agent/server-ca.crt
+  delegate_to: "{{ item }}"
+  loop: "{{ hpc_compute_hosts }}"
+  register: _joined
+  when: not _etcd.stat.exists and (_snaps.files | default([]) | length == 0)
+
+- name: Refuse to start a second cluster under the existing agents
+  ansible.builtin.fail:
+    msg: >-
+      {{ inventory_hostname }} has no etcd data and {{ hpc_backup_dir }}/etcd has no snapshot,
+      but {{ _old | join(', ') }} already joined a cluster. Starting now would create a new
+      cluster those nodes reject. Put a snapshot into {{ hpc_backup_dir }}/etcd (newest is used),
+      or set hpc_rke2_restore: false and re-provision the agents to start over.
+  vars:
+    _old: "{{ _joined.results | default([]) | selectattr('stat', 'defined') | selectattr('stat.exists') | map(attribute='item') | list }}"
+  when: not _etcd.stat.exists and (_snaps.files | default([]) | length == 0) and _old | length > 0

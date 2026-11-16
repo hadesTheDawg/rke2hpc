@@ -30,6 +30,29 @@
     state: directory
     mode: "0700"
 
+# A re-provisioned admin node gets its accounting history back from the newest
+# backup (roles/backup); the recorder then continues where the backup ended.
+- name: Accounting database
+  ansible.builtin.stat:
+    path: /var/lib/hpc/acct/acct.db
+  register: _db
+
+- name: Accounting backups
+  ansible.builtin.find:
+    paths: "{{ hpc_backup_dir }}/acct"
+    patterns: "acct-*.db"
+    file_type: file
+  register: _dbs
+  when: not _db.stat.exists and hpc_backup_dir | length > 0
+
+- name: Restore the accounting database
+  ansible.builtin.copy:
+    src: "{{ (_dbs.files | sort(attribute='mtime') | last).path }}"
+    dest: /var/lib/hpc/acct/acct.db
+    remote_src: true
+    mode: "0600"
+  when: not _db.stat.exists and (_dbs.files | default([]) | length > 0)
+
 - name: Settings
   ansible.builtin.copy:
     dest: /etc/hpc/acct.env

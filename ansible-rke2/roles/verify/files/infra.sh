@@ -49,4 +49,11 @@ if [ "$CEPH_ENABLED" = true ]; then
   t  "CephFS provisioner ready (all sidecars running)"    $KUBECTL -n "$CEPH_NS" rollout status deploy/ceph-csi-cephfs-provisioner --timeout=120s
   t  "every CephFS image comes from the system registry ($(ceph_images | wc -l | tr -d ' ') images)" ceph_local
 fi
+# ---- admin node state backups (docs/reprovisioning.md) ------------------------------
+if [ -n "$BACKUP_DIR" ]; then
+  fresh() { [ -n "$(find "$BACKUP_DIR/$1" -maxdepth 1 -type f -name "$2" -mmin -150 | head -1)" ]; }
+  t  "etcd snapshot in $BACKUP_DIR from the last 150 minutes"   fresh etcd 'hpc-backup-*'
+  t  "accounting database backup from the last 150 minutes"     fresh acct 'acct-*.db'
+  t  "backup timer is scheduled"                                systemctl is-active -q hpc-backup.timer
+fi
 summary

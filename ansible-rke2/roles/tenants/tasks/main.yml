@@ -61,6 +61,12 @@
     mode: "0600"
 
 # A rebuilt admin node gets its uid/gid allocations back from the last backup.
+- name: State directory
+  ansible.builtin.file:
+    path: /var/lib/hpc
+    state: directory
+    mode: "0755"
+
 - name: Id map on the admin node
   ansible.builtin.stat:
     path: /var/lib/hpc/idmap.json

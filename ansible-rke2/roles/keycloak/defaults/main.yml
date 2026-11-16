@@ -1,1 +1,2 @@
-hpc_keycloak_db_dir: /var/lib/hpc/keycloak-db   # PostgreSQL data, local disk of the admin node
+# PostgreSQL data: admin node's local disk, or hpc_persist_root when set
+hpc_keycloak_db_dir: "{{ (hpc_persist_root ~ '/keycloak-db') if hpc_persist_root else '/var/lib/hpc/keycloak-db' }}"

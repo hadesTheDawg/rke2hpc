@@ -33,11 +33,37 @@
     state: reloaded
   when: _nm.changed
 
-- name: Configuration directory
+- name: Configuration directories
   ansible.builtin.file:
-    path: /etc/rancher/rke2
+    path: "{{ item.p }}"
     state: directory
-    mode: "0755"
+    mode: "{{ item.m }}"
+  loop: [{p: /etc/rancher/rke2, m: "0755"}, {p: /etc/rancher/node, m: "0700"}]
+
+- name: Is RKE2 running
+  ansible.builtin.command: "systemctl is-active {{ _rke2_svc }}"
+  register: _active
+  changed_when: false
+  failed_when: false
+
+# RKE2 otherwise generates a random node password on first start, and the
+# server rejects a re-provisioned node that comes back with a different one
+# ("Node password rejected"). Derived from secrets/, it is the same every time.
+- name: Node password
+  ansible.builtin.copy:
+    dest: /etc/rancher/node/password
+    content: "{{ hpc_rke2_node_password }}"
+    mode: "0600"
+  register: _npw
+  no_log: true
+
+# Only when an already running node switches to the derived password (first
+# run of this on an existing cluster): the server still holds the old one.
+- name: Forget the node's previous password on the server
+  ansible.builtin.command: >-
+    {{ hpc_kubectl }} -n kube-system delete secret {{ inventory_hostname }}.node-password.rke2 --ignore-not-found
+  delegate_to: "{{ hpc_admin_host }}"
+  when: _npw.changed and _active.rc == 0
 
 # Every image comes from the admin node. Unqualified / docker.io references try
 # the user registry first, then the system registry.
@@ -59,17 +85,15 @@
     mode: "0600"
   register: _cfg
 
-- name: Is RKE2 running
-  ansible.builtin.command: "systemctl is-active {{ _rke2_svc }}"
-  register: _active
-  changed_when: false
-  failed_when: false
+- name: Restore a re-provisioned server
+  ansible.builtin.include_tasks: restore.yml
+  when: _rke2_server and _active.rc != 0 and (hpc_rke2_restore | bool) and hpc_backup_dir | length > 0
 
 - name: Start RKE2 (first start imports images; takes a few minutes)
   ansible.builtin.systemd_service:
     name: "{{ _rke2_svc }}"
     enabled: true
-    state: "{{ 'restarted' if (_active.rc == 0 and (_reg.changed or _cfg.changed or (_server_cfg_changed | default(false)))) else 'started' }}"
+    state: "{{ 'restarted' if (_active.rc == 0 and (_reg.changed or _cfg.changed or _npw.changed or (_server_cfg_changed | default(false)))) else 'started' }}"
 
 - name: Server is ready
   when: _rke2_server
@@ -98,3 +122,42 @@
         mode: "0644"
         content: |
           [ "$(id -u)" = 0 ] && export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+
+# After an etcd restore the cluster's data is older than what long-running
+# watchers on the compute nodes last saw, and they miss every change until the
+# store catches up with their old position. In the lab that broke pod network
+# policy (Calico) and Service name lookups (a CoreDNS replica on a compute node).
+# Restart every platform watcher there once; project pods keep running.
+- name: Refresh the compute nodes after a restore
+  when: _rke2_restored | default(false)
+  block:
+    - name: Restart rke2-agent and kube-proxy on the compute nodes
+      ansible.builtin.shell:
+        cmd: |
+          systemctl restart rke2-agent
+          c="/var/lib/rancher/rke2/bin/crictl --config /var/lib/rancher/rke2/agent/etc/crictl.yaml"
+          ids=$($c ps --name kube-proxy -q 2>/dev/null)
+          [ -z "$ids" ] || $c stop $ids >/dev/null
+      delegate_to: "{{ item }}"
+      loop: "{{ hpc_compute_hosts }}"
+      changed_when: true
+    # CNI, CSI node plugins, and Deployment replicas that landed on compute
+    # nodes (CoreDNS: in the lab it kept serving Services from before the
+    # restore). The admin node's pods are new anyway.
+    - name: Recreate the platform pods on the compute nodes
+      ansible.builtin.shell:
+        cmd: |
+          set -e
+          k="{{ hpc_kubectl }}"
+          for ns in $($k get ns -l 'hpc.io/tenant!=true' -o jsonpath='{.items[*].metadata.name}'); do
+            $k -n "$ns" delete pod --field-selector 'spec.nodeName!={{ hpc_admin_host }}' --wait=false
+          done
+          for i in $(seq 120); do
+            bad=$(for ns in $($k get ns -l 'hpc.io/tenant!=true' -o jsonpath='{.items[*].metadata.name}'); do
+                    $k -n "$ns" get pods --no-headers --field-selector 'spec.nodeName!={{ hpc_admin_host }}' 2>/dev/null \
+                      | grep -v -E ' (Running|Completed) ' || true; done)
+            [ -z "$bad" ] && exit 0
+            sleep 5
+          done
+          echo "not ready after 10 minutes:"; echo "$bad"; exit 1
+      changed_when: true

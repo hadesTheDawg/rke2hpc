@@ -1,9 +1,16 @@
 ---
 # NFS server on the admin node (management network).
-#   hpc_nfs_home_export  home directories, root squashed. Compute nodes mount them
-#                        into pods; add login nodes etc. via hpc_nfs_home_extra_clients.
+#   hpc_nfs_home_export  home directories, root squashed; only with hpc_home_volume: nfs.
+#                        Compute nodes mount them into pods; add login nodes etc.
+#                        via hpc_nfs_home_extra_clients.
 #   hpc_nfs_k8s_export   backs the "nfs" StorageClass; cluster nodes only (the
 #                        provisioner needs root).
+# Both default to directories under hpc_persist_root when that is set, so they
+# survive a re-provisioned admin node (docs/reprovisioning.md).
+- name: Home directories are exported only when pods mount them
+  ansible.builtin.set_fact:
+    _homes: "{{ hpc_home_volume == 'nfs' }}"
+
 - name: Package
   ansible.builtin.dnf:
     name: nfs-utils
@@ -14,7 +21,7 @@
     path: "{{ item }}"
     state: directory
     mode: "0755"
-  loop: ["{{ hpc_nfs_home_export }}", "{{ hpc_nfs_k8s_export }}"]
+  loop: "{{ ([hpc_nfs_home_export] if _homes else []) + [hpc_nfs_k8s_export] }}"
 
 - name: Exports
   ansible.builtin.copy:
@@ -22,10 +29,15 @@
     mode: "0644"
     content: |
       # managed by ansible (hpc nfs_server)
-      {{ hpc_nfs_home_export }} {% for c in (hpc_compute_hosts | map('extract', hostvars, 'hpc_mgmt_ip') | list) + hpc_nfs_home_extra_clients %}{{ c }}(rw,sync,root_squash,sec=sys) {% endfor %}
+      {% if _homes %}
+      {{ hpc_nfs_home_export }} {% for c in (hpc_compute_hosts | map('extract', hostvars, 'hpc_mgmt_ip') | list) + hpc_nfs_home_extra_clients %}{{ c }}(rw,sync,root_squash,sec=sys{{ _fsid_home }}) {% endfor %}
 
-      {{ hpc_nfs_k8s_export }} {% for h in hpc_cluster_hosts %}{{ hostvars[h].hpc_mgmt_ip }}(rw,sync,no_root_squash,sec=sys) {% endfor %}
+      {% endif %}
+      {{ hpc_nfs_k8s_export }} {% for h in hpc_cluster_hosts %}{{ hostvars[h].hpc_mgmt_ip }}(rw,sync,no_root_squash,sec=sys{{ _fsid_k8s }}) {% endfor %}
 
+  vars:
+    _fsid_home: "{{ ',fsid=7101' if hpc_nfs_export_fsid | bool else '' }}"
+    _fsid_k8s: "{{ ',fsid=7102' if hpc_nfs_export_fsid | bool else '' }}"
   register: _exports
 
 - name: nfs-server running

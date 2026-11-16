@@ -50,6 +50,8 @@ Generated state goes next to the inventory: `inventories/mysite/secrets/`
 (CA, certificates, every password, a backup of the uid/gid map). **Keep and
 back up that directory**; it is what makes a redeploy keep the same CA, uids
 and passwords. The download cache is `.bundle/<arch>/` (several GB).
+If the cluster manager can wipe nodes, set `hpc_persist_root`
+([docs/reprovisioning.md](docs/reprovisioning.md)); after a re-provision, re-run `site.yml`.
 
 | Playbook | Use |
 |----------|-----|
@@ -72,6 +74,7 @@ user and of the platform admin `opsadmin`).
 | [docs/ceph.md](docs/ceph.md) | CephFS CSI: what the registry carries, turning it on, homes on CephFS |
 | [docs/variables.md](docs/variables.md) | Every setting and where it is defined |
 | [docs/extending.md](docs/extending.md) | Switching components off, replacing them, adding new ones |
+| [docs/reprovisioning.md](docs/reprovisioning.md) | Nodes wiped by the cluster manager (HPCM): fixed node passwords, admin node state on CephFS, etcd backup and automatic restore |
 | [docs/lab-testing.md](docs/lab-testing.md) | The QEMU lab used to test this, and what was verified |
 | [docs/accounting.md](docs/accounting.md) | Usage accounting (measures only, enforces nothing) |
 
@@ -92,7 +95,9 @@ users/groups with their uids/gids):
 - **Projects** from the flat file: one namespace per group with a shared
   ResourceQuota, LimitRange, NetworkPolicy isolation, RBAC for the Keycloak
   group, Rancher project, Keycloak users and groups, uids from 5001 / gids from
-  6001, home directories on NFS mounted into every pod, pods run as the
-  submitting user.
+  6001. Every project pod carries its submitter's unix name (label and
+  annotation `hpc.io/user`, also through Deployments, Jobs and Rancher).
+  Optional (`all.yml-with-user-home.example`): pods run as the submitter's
+  uid/gid with their NFS home mounted.
 - **Accounting**: job ids, users, elapsed time, CPU-hours per project.
 - **Storage**: NFS StorageClass from the admin node, and/or CephFS CSI.

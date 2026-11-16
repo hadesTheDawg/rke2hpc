@@ -59,7 +59,7 @@ address the deployer uses (management network).
 
 `hpc_enable_bundle`, `_base`, `_registry`, `_nfs_server`, `_rke2`, `_platform`,
 `_ceph_csi` (off), `_keycloak`, `_rancher`, `_identity`, `_tenants`,
-`_accounting`. See [extending.md](extending.md).
+`_accounting`, `_backup` (on when `hpc_backup_dir` is set). See [extending.md](extending.md).
 
 ## Storage and homes
 
@@ -67,12 +67,28 @@ address the deployer uses (management network).
 |----------|---------|-|
 | `hpc_data_root` | `/srv/hpc` | admin node: bundle, registry storage, repo |
 | `hpc_home_root` | `/c/home` | home path inside pods |
-| `hpc_nfs_home_export`, `hpc_nfs_k8s_export` | `/c/home`, `/c/k8s` | exports on the admin node |
+| `hpc_nfs_home_export`, `hpc_nfs_k8s_export` | `/c/home`, `/c/k8s` | exports on the admin node (under `hpc_persist_root` when set) |
 | `hpc_nfs_home_extra_clients` | `[]` | more hosts/CIDRs allowed to mount homes (login nodes) |
-| `hpc_home_volume` | `nfs` | mount the owner's home into project pods (`none` to stop) |
+| `hpc_pod_identity` | `name` | `name`: pods carry the submitter's unix name (label + annotation `hpc.io/user`) and run as the image's user. `uid`: they also run as the submitter's uid/gid |
+| `hpc_home_volume` | `none` | `nfs`: mount the owner's home into project pods (needs `hpc_pod_identity: uid`) |
 | `hpc_home_nfs_server`, `hpc_home_nfs_path` | admin node, export | where pod homes come from |
-| `hpc_home_create_root` | the export | where hpc-sync creates new homes (`''` = elsewhere) |
+| `hpc_home_create_root` | the export when homes are on | where hpc-sync creates new homes (`''` = elsewhere) |
+
+Turning homes on: `inventories/example/group_vars/all.yml-with-user-home.example`.
 | `hpc_ceph_*` | | [ceph.md](ceph.md) |
+
+## Re-provisioned nodes
+
+[reprovisioning.md](reprovisioning.md).
+
+| Variable | Default | |
+|----------|---------|-|
+| `hpc_persist_root` | `''` | storage that outlives the admin node; moves exports, Keycloak DB and backups there |
+| `hpc_persist_require_mount` | `true` | preflight: `hpc_persist_root` must not be on `/` |
+| `hpc_backup_dir` | `<persist root>/backup` | etcd + accounting backups (`''` = none) |
+| `hpc_backup_schedule`, `hpc_backup_keep` | `hourly`, `48` | systemd OnCalendar, copies kept |
+| `hpc_rke2_restore` | `true` | restore the newest snapshot onto an admin node that has no etcd |
+| `hpc_nfs_export_fsid` | `true` with a persist root | fixed `fsid` per export (needed on CephFS) |
 
 ## Identity and tenancy
 

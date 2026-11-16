@@ -1,0 +1,88 @@
+---
+# Backups of the admin node's state that the deployer cannot regenerate (etcd,
+# accounting history) to hpc_backup_dir, which must be on storage that survives
+# a re-provisioned admin node. Restores happen in the rke2 and accounting roles.
+- name: Backup directory
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: directory
+    mode: "0700"
+  loop: ["{{ hpc_backup_dir }}", "{{ hpc_backup_dir }}/etcd", "{{ hpc_backup_dir }}/acct"]
+
+- name: Mount marker (hpc-backup refuses to run without it)
+  ansible.builtin.copy:
+    dest: "{{ hpc_backup_dir }}/.hpc-backup"
+    mode: "0600"
+    content: |
+      Backups of the {{ hpc_cluster_name }} RKE2 admin node ({{ hpc_admin_host }}). Written by hpc-backup.timer.
+      Restored automatically by site.yml when the admin node comes back without its data.
+      The etcd snapshots contain every cluster secret: keep this directory root-only.
+
+- name: hpc-backup
+  ansible.builtin.copy:
+    src: hpc-backup
+    dest: /usr/local/sbin/hpc-backup
+    mode: "0755"
+
+- name: Settings
+  ansible.builtin.copy:
+    dest: /etc/hpc/backup.env
+    mode: "0644"
+    content: |
+      # managed by ansible (hpc backup)
+      BACKUP_DIR={{ hpc_backup_dir }}
+      KEEP={{ hpc_backup_keep }}
+
+- name: systemd units
+  ansible.builtin.copy:
+    dest: "/etc/systemd/system/{{ item.name }}"
+    mode: "0644"
+    content: "{{ item.content }}"
+  loop:
+    - name: hpc-backup.service
+      content: |
+        [Unit]
+        Description=Back up the RKE2 admin node's state to {{ hpc_backup_dir }}
+        After=rke2-server.service
+        Requires=rke2-server.service
+        RequiresMountsFor={{ hpc_backup_dir }}
+
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/hpc-backup
+    - name: hpc-backup.timer
+      content: |
+        [Unit]
+        Description=Back up the RKE2 admin node's state
+
+        [Timer]
+        OnCalendar={{ hpc_backup_schedule }}
+        RandomizedDelaySec=120
+        Persistent=true
+
+        [Install]
+        WantedBy=timers.target
+  loop_control:
+    label: "{{ item.name }}"
+  register: _units
+
+- name: Timer enabled
+  ansible.builtin.systemd_service:
+    name: hpc-backup.timer
+    enabled: true
+    state: started
+    daemon_reload: "{{ _units.changed }}"
+
+# A fresh restore point after every deployment run.
+- name: Back up now
+  ansible.builtin.command: systemctl start hpc-backup.service
+  changed_when: true
+
+- name: Backup result
+  ansible.builtin.command: journalctl -u hpc-backup.service -n 3 -o cat --no-pager
+  register: _bk
+  changed_when: false
+
+- name: Last backup
+  ansible.builtin.debug:
+    msg: "{{ _bk.stdout_lines }}"

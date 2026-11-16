@@ -61,3 +61,25 @@
   delegate_to: localhost
   run_once: true
   changed_when: false
+
+# Persistent storage for the admin node's state (docs/reprovisioning.md). If the
+# mount is missing, writing there would silently land on the local disk that a
+# re-provision wipes.
+- name: Persistent storage is mounted on the admin node
+  ansible.builtin.shell:
+    cmd: |
+      p="{{ hpc_persist_root }}"
+      while [ ! -e "$p" ]; do p=$(dirname "$p"); done
+      findmnt -n -o TARGET,FSTYPE -T "$p"
+  register: _persist_mnt
+  changed_when: false
+  failed_when: >-
+    _persist_mnt.rc != 0 or
+    ((hpc_persist_require_mount | bool) and _persist_mnt.stdout.split()[0] == '/')
+  when: inventory_hostname == hpc_admin_host and hpc_persist_root | length > 0
+
+- name: Home directories need pods that run as their user
+  ansible.builtin.assert:
+    that: hpc_home_volume != 'nfs' or hpc_pod_identity == 'uid'
+    fail_msg: "hpc_home_volume: nfs mounts homes owned by each user's uid; set hpc_pod_identity: uid as well"
+  run_once: true

@@ -35,6 +35,6 @@
 - name: Generated credentials exist
   ansible.builtin.set_fact:
     _hpc_touch: "{{ [hpc_registry_pull_password, hpc_registry_push_password, hpc_registry_http_secret,
-                     hpc_rke2_server_token, hpc_rke2_agent_token, hpc_keycloak_admin_password,
+                     hpc_rke2_server_token, hpc_rke2_agent_token, hpc_rke2_node_password_seed, hpc_keycloak_admin_password,
                      hpc_keycloak_db_password, hpc_rancher_admin_password, hpc_rancher_oidc_secret] | length }}"
   no_log: true

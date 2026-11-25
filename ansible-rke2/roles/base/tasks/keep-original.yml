@@ -1,0 +1,12 @@
+---
+# Save <_keep> to /var/lib/hpc/base/orig<_keep> once, before this role first
+# replaces it, so rollback.yml (uninstall) can put the original back.
+- name: "Keep the original {{ _keep }}"
+  ansible.builtin.shell:
+    cmd: |
+      f={{ _keep | quote }} d=/var/lib/hpc/base/orig
+      [ -f "$f" ] && [ ! -e "$d$f" ] || exit 0
+      grep -q 'managed by ansible (hpc' "$f" && exit 0     # already ours: the original is gone
+      mkdir -p "$d$(dirname "$f")" && cp -a "$f" "$d$f" && echo kept
+  register: _kept
+  changed_when: "'kept' in _kept.stdout"

@@ -16,8 +16,8 @@ http:
   addr: {{ item.addr }}
   secret: {{ hpc_registry_http_secret }}
   tls:
-    certificate: /etc/hpc-registry/admin.crt
-    key: /etc/hpc-registry/admin.key
+    certificate: /etc/hpc-registry/{{ item.cert }}.crt
+    key: /etc/hpc-registry/{{ item.cert }}.key
     minimumtls: tls1.2
   headers:
     X-Content-Type-Options: [nosniff]

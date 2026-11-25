@@ -18,4 +18,4 @@
   'kube-apiserver-arg': [
     'authentication-config=/var/lib/rancher/rke2/server/etc/hpc-authentication.yaml',
     'enable-admission-plugins=NodeRestriction,PodNodeSelector'],
-} | combine(hpc_rke2_extra_server_config)) | to_nice_yaml(indent=2) }}
+} | combine(_hpc_harvester_rke2) | combine(hpc_rke2_extra_server_config)) | to_nice_yaml(indent=2) }}

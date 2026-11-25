@@ -1,0 +1,71 @@
+---
+# Harvester integration (docs/harvester.md). Runs on the admin node after Rancher.
+#   hpc_harvester_ui     Rancher's Harvester UI extension ("Virtualization
+#                        Management"), its files served by the admin node, so an
+#                        offline Rancher can import and manage Harvester clusters.
+#   hpc_harvester_guest  (rke2 role) the cluster's nodes are Harvester VMs: RKE2
+#                        runs the Harvester cloud provider and CSI driver; their
+#                        images come from the bundle's rke2-images-harvester tarball.
+# A VM lab cannot run Harvester; only the UI extension is exercised there.
+- name: Admin tools
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: admin-tools
+
+- name: Harvester UI extension
+  when: hpc_harvester_ui | bool
+  block:
+    - name: Rancher is part of the deployment
+      ansible.builtin.assert:
+        that: hpc_enable_rancher | bool
+        fail_msg: "hpc_harvester_ui needs Rancher (hpc_enable_rancher); set hpc_harvester_ui: false otherwise"
+
+    - name: Namespace for UI extensions
+      ansible.builtin.shell:
+        cmd: "set -o pipefail; {{ hpc_kubectl }} create namespace cattle-ui-plugin-system --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -"
+      register: _ns
+      changed_when: "'created' in _ns.stdout"
+
+    - name: Chart values (files from the admin node instead of GitHub)
+      ansible.builtin.copy:
+        dest: /etc/hpc/harvester-ui-values.yaml
+        mode: "0600"
+        content: |
+          plugin:
+            endpoint: {{ hpc_harvester_ui_url }}/{{ hpc_harvester_ui_version }}
+            compressedEndpoint: {{ hpc_harvester_ui_url }}/{{ hpc_harvester_ui_version }}.tgz
+
+    - name: Harvester UI extension chart
+      ansible.builtin.command:
+        argv:
+          - /usr/local/libexec/hpc/hpc-helm-release
+          - cattle-ui-plugin-system
+          - harvester
+          - "{{ hpc_data_root }}/bundle/charts/harvester-{{ hpc_harvester_ui_version }}.tgz"
+          - /etc/hpc/harvester-ui-values.yaml
+          - 5m
+      register: _hrel
+      changed_when: "'deployed' in _hrel.stdout"
+
+    - name: Rancher fetched and cached the extension
+      ansible.builtin.command: >-
+        {{ hpc_kubectl }} -n cattle-ui-plugin-system get uiplugin harvester -o jsonpath={.status.cacheState}
+      register: _cache
+      until: _cache.stdout == 'cached'
+      retries: 36
+      delay: 5
+      changed_when: false
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Pin the extension namespace
+      ansible.builtin.include_role:
+        name: hpc_common
+        tasks_from: pin-namespaces
+
+- name: Guest-cluster mode
+  ansible.builtin.debug:
+    msg: >-
+      hpc_harvester_guest: RKE2 runs with cloud-provider-name=harvester and
+      {{ hpc_harvester_cloud_config_file }} (rke2 role). Volumes: StorageClass 'harvester'.
+  when: hpc_harvester_guest | bool

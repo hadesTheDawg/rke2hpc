@@ -1,0 +1,41 @@
+---
+# Admin node, before the server is removed: keep the cluster's last state.
+- name: Is rke2-server running
+  ansible.builtin.command: systemctl is-active rke2-server
+  register: _rb_active
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: Final snapshot
+  when: _rb_active.rc == 0
+  block:
+    - name: etcd snapshot hpc-pre-uninstall
+      ansible.builtin.command: /usr/bin/rke2 etcd-snapshot save --name hpc-pre-uninstall
+      changed_when: true
+    - name: Newest hpc-pre-uninstall snapshot
+      ansible.builtin.shell:
+        cmd: >-
+          find /var/lib/rancher/rke2/server/db/snapshots -maxdepth 1 -type f -name 'hpc-pre-uninstall-*'
+          -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-
+      register: _rb_final
+      changed_when: false
+      check_mode: false
+      failed_when: _rb_final.stdout | length == 0
+    - name: Into the backup directory
+      ansible.builtin.copy:
+        src: "{{ _rb_final.stdout }}"
+        dest: "{{ hpc_backup_dir }}/etcd/{{ _rb_final.stdout | basename }}"
+        remote_src: true
+        mode: "0600"
+      when: hpc_backup_dir | length > 0
+    - name: To the deployer (no backup directory)
+      ansible.builtin.fetch:
+        src: "{{ _rb_final.stdout }}"
+        dest: "{{ hpc_secrets_dir }}/snapshots/{{ _rb_final.stdout | basename }}"
+        flat: true
+      when: hpc_backup_dir | length == 0
+    - name: Saved
+      ansible.builtin.debug:
+        msg: >-
+          final etcd snapshot: {{ (hpc_backup_dir ~ '/etcd/') if hpc_backup_dir else (hpc_secrets_dir ~ '/snapshots/ on the deployer: ') }}{{ _rb_final.stdout | basename }}

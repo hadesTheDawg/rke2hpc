@@ -1,0 +1,30 @@
+---
+# Checks shared by every mode. Runs once, before anything is changed.
+- name: Mode
+  ansible.builtin.assert:
+    that: hpc_rollback_mode in ['list', 'previous', 'uninstall']
+    fail_msg: >-
+      choose -e hpc_rollback_mode=list (show restore points), previous (go back to the state before the last
+      version change or to a chosen snapshot) or uninstall (remove the deployment). docs/rollback.md
+
+- name: Confirmation
+  ansible.builtin.assert:
+    that: hpc_rollback_confirm == hpc_cluster_name
+    fail_msg: >-
+      {{ hpc_rollback_mode }} changes the cluster '{{ hpc_cluster_name }}'
+      ({{ (ansible_play_hosts_all | join(', ')) }}). To go ahead add -e hpc_rollback_confirm={{ hpc_cluster_name }}
+  when: hpc_rollback_mode != 'list'
+
+- name: previous needs every node
+  ansible.builtin.assert:
+    that: hpc_cluster_hosts | difference(ansible_play_hosts_all) | length == 0
+    fail_msg: "previous restores the whole cluster: run it without --limit (missing: {{ hpc_cluster_hosts | difference(ansible_play_hosts_all) | join(', ') }})"
+  when: hpc_rollback_mode == 'previous'
+
+- name: Uninstalling the admin node removes the cluster
+  ansible.builtin.assert:
+    that: hpc_admin_host not in ansible_play_hosts_all or hpc_cluster_hosts | difference(ansible_play_hosts_all) | length == 0
+    fail_msg: >-
+      {{ hpc_admin_host }} (the RKE2 server) is selected but {{ hpc_cluster_hosts | difference(ansible_play_hosts_all) | join(', ') }}
+      are not. Uninstall everything (no --limit), or only compute nodes (--limit with compute nodes).
+  when: hpc_rollback_mode == 'uninstall'

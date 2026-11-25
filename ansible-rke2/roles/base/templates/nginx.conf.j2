@@ -1,4 +1,5 @@
-# managed by ansible (hpc base): serves the offline dnf repo and the site CA, TLS only.
+# managed by ansible (hpc base): serves the offline dnf repo, the site's own RPMs, the chart
+# repository, Rancher UI extension files and the CA, TLS only.
 user nginx;
 worker_processes auto;
 error_log /var/log/nginx/error.log;
@@ -17,6 +18,17 @@ http {
     ssl_certificate_key /etc/pki/hpc/admin.key;
     ssl_protocols TLSv1.2 TLSv1.3;
     root {{ hpc_data_root }}/www;
+{% if hpc_offline_repo | bool %}
     location /repo/ { alias {{ hpc_data_root }}/bundle/rpms/; autoindex on; }
+{% endif %}
+{% if _hpc_local_rpms | length > 0 %}
+    location /local/ { alias {{ hpc_data_root }}/local-rpms/; autoindex on; }
+{% endif %}
+{% if hpc_enable_charts_repo | bool %}
+    location /charts/ { alias {{ hpc_data_root }}/charts/; autoindex on; }
+{% endif %}
+{% if _hpc_ui_plugins | bool %}
+    location /ui-plugins/ { alias {{ hpc_data_root }}/ui-plugins/; autoindex on; }
+{% endif %}
   }
 }

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# hpc-restart-if-stale <namespace> <deployment> <file>...
+# Restarts the deployment when one of its pods started before one of the files
+# last changed, e.g. a trust bundle that the program reads only at start.
+# Prints "restarted" when it did.
+set -euo pipefail
+K="/var/lib/rancher/rke2/bin/kubectl --kubeconfig /etc/rancher/rke2/rke2.yaml"
+ns="$1" dep="$2"; shift 2
+newest=0
+for f in "$@"; do m=$(stat -c %Y "$f"); [ "$m" -gt "$newest" ] && newest=$m; done
+sel=$($K -n "$ns" get deployment "$dep" -o go-template='{{range $k, $v := .spec.selector.matchLabels}}{{$k}}={{$v}},{{end}}')
+for t in $($K -n "$ns" get pods -l "${sel%,}" -o jsonpath='{range .items[*]}{.status.startTime}{"\n"}{end}'); do
+  if [ "$(date -d "$t" +%s)" -lt "$newest" ]; then
+    $K -n "$ns" rollout restart deployment "$dep" >/dev/null
+    $K -n "$ns" rollout status deployment "$dep" --timeout=900s >/dev/null
+    echo restarted; exit 0
+  fi
+done
+echo current

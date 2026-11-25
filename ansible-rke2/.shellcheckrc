@@ -1,0 +1,3 @@
+# check.sh: the verify scripts are sourced by bash, and set variables the next one reads
+shell=bash
+disable=SC2034

@@ -14,7 +14,7 @@
 
 - name: Platform namespaces
   ansible.builtin.shell:
-    cmd: "{{ hpc_kubectl }} create namespace {{ item }} --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -"
+    cmd: "set -o pipefail; {{ hpc_kubectl }} create namespace {{ item }} --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -"
   loop: "{{ hpc_platform_namespaces }}"
   register: _ns
   changed_when: "'created' in _ns.stdout"
@@ -27,11 +27,30 @@
 - name: Site certificate as the ingress default
   ansible.builtin.shell:
     cmd: >-
+      set -o pipefail;
       {{ hpc_kubectl }} -n kube-system create secret tls hpc-ingress-tls
       --cert=/etc/pki/hpc/ingress.crt --key=/etc/pki/hpc/ingress.key --dry-run=client -o yaml
       | {{ hpc_kubectl }} apply -f -
   register: _sec
   changed_when: "'configured' in _sec.stdout or 'created' in _sec.stdout"
+
+# Traefik picks a certificate by SNI from every ingress secret. Rancher's and
+# Keycloak's secrets carry the same ingress certificate, so when it changes
+# (e.g. an own certificate added or removed, docs/certificates.md) all of them
+# change here at once; otherwise the stale one can keep being served for both
+# names until its role runs.
+- name: Same certificate in the Rancher and Keycloak ingress secrets
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      k="{{ hpc_kubectl }}"
+      for s in {{ ((['keycloak/keycloak-tls'] if hpc_enable_keycloak | bool else []) + (['cattle-system/tls-rancher-ingress'] if hpc_enable_rancher | bool else [])) | join(' ') }}; do
+        $k -n "${s%/*}" get secret "${s#*/}" >/dev/null 2>&1 || continue    # first install: the role creates it
+        $k -n "${s%/*}" create secret tls "${s#*/}" --cert=/etc/pki/hpc/ingress.crt --key=/etc/pki/hpc/ingress.key \
+          --dry-run=client -o yaml | $k apply -f -
+      done
+  register: _ingsec
+  changed_when: "'configured' in _ingsec.stdout"
 
 - name: Traefik CRDs present
   ansible.builtin.command: "{{ hpc_kubectl }} get crd tlsstores.traefik.io"
@@ -40,6 +59,7 @@
   retries: 60
   delay: 5
   changed_when: false
+  check_mode: false
 
 - name: Traefik TLS store
   ansible.builtin.command: /usr/local/libexec/hpc/hpc-apply-tlsstore
@@ -50,25 +70,32 @@
 # project ResourceQuota (requests.storage) limits what can be requested.
 - name: NFS StorageClass
   when: hpc_enable_nfs_server | bool
-  ansible.builtin.shell:
-    cmd: |
-      {{ hpc_helm }} upgrade --install nfs-provisioner \
-        {{ hpc_data_root }}/bundle/charts/nfs-subdir-external-provisioner-{{ hpc_nfs_provisioner_chart_version }}.tgz \
-        --namespace hpc-storage --wait --timeout 5m -f - <<'YAML'
-      image:
-        repository: {{ hpc_sysreg }}/sig-storage/nfs-subdir-external-provisioner
-        tag: {{ hpc_nfs_provisioner_image_tag }}
-      nfs:
-        server: {{ hpc_admin_ip }}
-        path: {{ hpc_nfs_k8s_export }}
-      storageClass:
-        name: nfs
-        defaultClass: {{ (hpc_storage_backend == 'nfs') | string | lower }}
-        archiveOnDelete: true
-        pathPattern: "${.PVC.namespace}/${.PVC.name}"
-        accessModes: ReadWriteMany
-      YAML
-  environment:
-    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
-    PATH: "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-  changed_when: true
+  block:
+    - name: NFS provisioner chart values
+      ansible.builtin.copy:
+        dest: /etc/hpc/nfs-provisioner-values.yaml
+        mode: "0600"
+        content: |
+          image:
+            repository: {{ hpc_sysreg }}/sig-storage/nfs-subdir-external-provisioner
+            tag: {{ hpc_nfs_provisioner_image_tag }}
+          nfs:
+            server: {{ hpc_admin_ip }}
+            path: {{ hpc_nfs_k8s_export }}
+          storageClass:
+            name: nfs
+            defaultClass: {{ (hpc_storage_backend == 'nfs') | string | lower }}
+            archiveOnDelete: true
+            pathPattern: "${.PVC.namespace}/${.PVC.name}"
+            accessModes: ReadWriteMany
+    - name: NFS provisioner
+      ansible.builtin.command:
+        argv:
+          - /usr/local/libexec/hpc/hpc-helm-release
+          - hpc-storage
+          - nfs-provisioner
+          - "{{ hpc_data_root }}/bundle/charts/nfs-subdir-external-provisioner-{{ hpc_nfs_provisioner_chart_version }}.tgz"
+          - /etc/hpc/nfs-provisioner-values.yaml
+          - 5m
+      register: _nfsrel
+      changed_when: "'deployed' in _nfsrel.stdout"

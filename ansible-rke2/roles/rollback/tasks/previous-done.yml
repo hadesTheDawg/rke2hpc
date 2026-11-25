@@ -1,0 +1,20 @@
+---
+# Admin node, last step of previous: every node back, then what to do next.
+- name: Every node Ready
+  ansible.builtin.shell:
+    cmd: "{{ hpc_kubectl }} get nodes --no-headers | awk '$2==\"Ready\"' | wc -l"
+  register: _rb_ready
+  until: _rb_ready.stdout | int == hpc_cluster_hosts | length
+  retries: 120
+  delay: 5
+  changed_when: false
+  check_mode: false
+
+- name: Done
+  ansible.builtin.debug:
+    msg:
+      - "restored {{ _rb_snapshot | basename }}, RKE2 {{ _rb_version }}"
+      - "Set in group_vars, so that site.yml keeps this version: hpc_rke2_version: {{ _rb_version }}{{
+         ('   hpc_rancher_version: ' ~ _rb_state.rancher_from)
+         if (_rb_state.rancher_from | default('')) and (_rb_state.snapshot | default('') | basename) == (_rb_snapshot | basename) else '' }}"
+      - "Then run site.yml: it re-applies Keycloak, projects and accounting, which etcd does not hold."

@@ -6,17 +6,47 @@
     _rke2_server: "{{ inventory_hostname == hpc_admin_host }}"
     _rke2_svc: "{{ 'rke2-server' if inventory_hostname == hpc_admin_host else 'rke2-agent' }}"
 
-- name: Packages
+# An installed RKE2 is never reinstalled or changed by a re-run (nor by a newer
+# version showing up in the repository): only missing packages are installed,
+# RKE2 at exactly hpc_rke2_version. Changing the version of an installed node
+# takes -e hpc_rke2_upgrade=true (upgrade.yml).
+- name: Installed packages
+  ansible.builtin.command:
+    argv: [rpm, -q, --qf, "%{NAME} %{VERSION}\n", "{{ _rke2_svc }}", rke2-selinux, nfs-utils]
+  register: _rpmq
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: What is installed
+  ansible.builtin.set_fact:
+    _rke2_installed: "{{ _have | select('match', '^' ~ _rke2_svc ~ ' ') | map('split') | map('last') | first | default('') }}"
+    _rke2_missing: "{{ [_rke2_svc, 'rke2-selinux', 'nfs-utils'] | reject('in', _have | map('split') | map('first') | list) | list }}"
+  vars:
+    _have: "{{ _rpmq.stdout_lines | reject('search', 'not installed') | list }}"
+
+- name: Install what is missing
   ansible.builtin.dnf:
-    name: ["{{ _rke2_svc }}", rke2-selinux, nfs-utils]
+    name: "{{ _rke2_missing | map('regex_replace', '^(rke2-server|rke2-agent)$', '\\1-' ~ _hpc_rke2_rpm_version) | list }}"
     state: present
+  when: _rke2_missing | length > 0
+
+- name: RKE2 already installed
+  ansible.builtin.debug:
+    msg: >-
+      {{ inventory_hostname }}: {{ _rke2_svc }} {{ _rke2_installed }} is installed{{ '' if _rke2_installed == _hpc_rke2_rpm_version
+      else (', hpc_rke2_version is ' ~ hpc_rke2_version ~ '. Left as it is; to change it run site.yml with -e hpc_rke2_upgrade=true (docs/rollback.md)') }}
+  when: _rke2_installed | length > 0 and (_rke2_installed != _hpc_rke2_rpm_version) and not (hpc_rke2_upgrade | bool)
+
+- name: Is virt_use_nfs on
+  ansible.builtin.command: getsebool virt_use_nfs
+  register: _sebool
+  changed_when: false
+  check_mode: false
 
 - name: Pods may mount NFS volumes (SELinux)
-  ansible.builtin.shell:
-    cmd: |
-      if [ "$(getsebool virt_use_nfs | awk '{print $3}')" != on ]; then setsebool -P virt_use_nfs on; echo changed; fi
-  register: _sebool
-  changed_when: "'changed' in _sebool.stdout"
+  ansible.builtin.command: setsebool -P virt_use_nfs on
+  when: "'--> on' not in _sebool.stdout"
 
 - name: NetworkManager leaves the CNI interfaces alone
   ansible.builtin.copy:
@@ -45,6 +75,7 @@
   register: _active
   changed_when: false
   failed_when: false
+  check_mode: false
 
 # RKE2 otherwise generates a random node password on first start, and the
 # server rejects a re-provisioned node that comes back with a different one
@@ -78,12 +109,38 @@
   ansible.builtin.include_tasks: server-files.yml
   when: _rke2_server
 
+# Nodes that are Harvester VMs (docs/harvester.md): the kubeconfig Harvester
+# generated for this cluster; RKE2 runs the Harvester cloud provider and CSI.
+- name: Harvester cloud-provider configuration
+  when: _hpc_harvester_rke2 | length > 0
+  block:
+    - name: The site put Harvester's cloud config next to the inventory
+      ansible.builtin.stat:
+        path: "{{ hpc_harvester_cloud_config_file }}"
+      register: _hcc
+      delegate_to: localhost
+      become: false
+    - name: Harvester cloud config present
+      ansible.builtin.assert:
+        that: _hcc.stat.exists
+        fail_msg: "hpc_harvester_guest needs {{ hpc_harvester_cloud_config_file }} (Harvester: Virtual Machines > Generate addon config)"
+    - name: Harvester cloud config
+      ansible.builtin.copy:
+        src: "{{ hpc_harvester_cloud_config_file }}"
+        dest: /etc/rancher/rke2/harvester-cloud-config
+        mode: "0600"
+      register: _hcc_copy
+
 - name: config.yaml
   ansible.builtin.template:
     src: "{{ 'config-server.yaml.j2' if _rke2_server else 'config-agent.yaml.j2' }}"
     dest: /etc/rancher/rke2/config.yaml
     mode: "0600"
   register: _cfg
+
+- name: Change the installed version (hpc_rke2_upgrade)
+  ansible.builtin.include_tasks: upgrade.yml
+  when: _rke2_installed | length > 0 and _rke2_installed != _hpc_rke2_rpm_version and (hpc_rke2_upgrade | bool)
 
 - name: Restore a re-provisioned server
   ansible.builtin.include_tasks: restore.yml
@@ -93,7 +150,35 @@
   ansible.builtin.systemd_service:
     name: "{{ _rke2_svc }}"
     enabled: true
-    state: "{{ 'restarted' if (_active.rc == 0 and (_reg.changed or _cfg.changed or _npw.changed or (_server_cfg_changed | default(false)))) else 'started' }}"
+    state: started
+
+# A running node whose configuration or version changed is restarted. Compute
+# nodes go hpc_agent_batch at a time (0 = all at once), each batch waiting
+# for its kubelets to answer before the next starts (docs/operations.md).
+- name: Needs a restart
+  ansible.builtin.set_fact:
+    _rke2_restart: >-
+      {{ _active.rc == 0 and (_reg.changed or _cfg.changed or _npw.changed or (_hcc_copy.changed | default(false))
+         or (_server_cfg_changed | default(false)) or (_rke2_version_changed | default(false))) }}
+
+- name: Restart the server (configuration or version changed)
+  ansible.builtin.systemd_service:
+    name: rke2-server
+    state: restarted
+  when: _rke2_server and _rke2_restart | bool
+
+- name: "Restart compute nodes, {{ hpc_agent_batch if hpc_agent_batch | int > 0 else 'all' }} at a time"
+  ansible.builtin.shell:
+    cmd: |
+      systemctl restart rke2-agent
+      for _ in $(seq {{ (hpc_agent_restart_timeout | int / 5) | round(0, 'ceil') | int }}); do
+        curl -sf -m 5 http://127.0.0.1:10248/healthz >/dev/null 2>&1 && exit 0
+        sleep 5
+      done
+      echo "kubelet on {{ inventory_hostname }} did not answer within {{ hpc_agent_restart_timeout }} s after the restart" >&2
+      exit 1
+  throttle: "{{ hpc_agent_batch | int }}"
+  when: not _rke2_server and _rke2_restart | bool
 
 - name: Server is ready
   when: _rke2_server
@@ -105,6 +190,7 @@
       retries: 120
       delay: 5
       changed_when: false
+      check_mode: false
     - name: kubectl and helm for root
       ansible.builtin.file:
         src: /var/lib/rancher/rke2/bin/kubectl
@@ -123,41 +209,12 @@
         content: |
           [ "$(id -u)" = 0 ] && export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
 
-# After an etcd restore the cluster's data is older than what long-running
-# watchers on the compute nodes last saw, and they miss every change until the
-# store catches up with their old position. In the lab that broke pod network
-# policy (Calico) and Service name lookups (a CoreDNS replica on a compute node).
-# Restart every platform watcher there once; project pods keep running.
+# After an etcd restore the compute nodes' watchers are stale (refresh-agents.yml).
 - name: Refresh the compute nodes after a restore
+  ansible.builtin.include_tasks: refresh-agents.yml
   when: _rke2_restored | default(false)
-  block:
-    - name: Restart rke2-agent and kube-proxy on the compute nodes
-      ansible.builtin.shell:
-        cmd: |
-          systemctl restart rke2-agent
-          c="/var/lib/rancher/rke2/bin/crictl --config /var/lib/rancher/rke2/agent/etc/crictl.yaml"
-          ids=$($c ps --name kube-proxy -q 2>/dev/null)
-          [ -z "$ids" ] || $c stop $ids >/dev/null
-      delegate_to: "{{ item }}"
-      loop: "{{ hpc_compute_hosts }}"
-      changed_when: true
-    # CNI, CSI node plugins, and Deployment replicas that landed on compute
-    # nodes (CoreDNS: in the lab it kept serving Services from before the
-    # restore). The admin node's pods are new anyway.
-    - name: Recreate the platform pods on the compute nodes
-      ansible.builtin.shell:
-        cmd: |
-          set -e
-          k="{{ hpc_kubectl }}"
-          for ns in $($k get ns -l 'hpc.io/tenant!=true' -o jsonpath='{.items[*].metadata.name}'); do
-            $k -n "$ns" delete pod --field-selector 'spec.nodeName!={{ hpc_admin_host }}' --wait=false
-          done
-          for i in $(seq 120); do
-            bad=$(for ns in $($k get ns -l 'hpc.io/tenant!=true' -o jsonpath='{.items[*].metadata.name}'); do
-                    $k -n "$ns" get pods --no-headers --field-selector 'spec.nodeName!={{ hpc_admin_host }}' 2>/dev/null \
-                      | grep -v -E ' (Running|Completed) ' || true; done)
-            [ -z "$bad" ] && exit 0
-            sleep 5
-          done
-          echo "not ready after 10 minutes:"; echo "$bad"; exit 1
-      changed_when: true
+
+# Read by the "All nodes Ready" play: the nodes that got through this role.
+- name: RKE2 done on this node
+  ansible.builtin.set_fact:
+    _hpc_rke2_done: true

@@ -12,6 +12,13 @@
     that: _manifest.stat.exists
     fail_msg: "no bundle at {{ hpc_bundle_dir }}; run with hpc_bundle_fetch=true (needs internet) first"
 
+- name: Bundle matches the settings
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ hpc_bundle_dir }} was built for other settings (versions, image or RPM lists) than
+      this inventory has. Pushing it as it is; run with hpc_bundle_fetch=true to rebuild it.
+  when: lookup('ansible.builtin.file', hpc_bundle_dir ~ '/MANIFEST') != _hpc_manifest | trim
+
 - name: Bundle directory on the admin node
   ansible.builtin.file:
     path: "{{ hpc_data_root }}/bundle"
@@ -25,6 +32,7 @@
   ansible.builtin.command: rpm -q rsync
   register: _rsync
   changed_when: false
+  check_mode: false
   failed_when: false
   delegate_to: "{{ hpc_admin_host }}"
 
@@ -50,11 +58,22 @@
       delegate_to: "{{ hpc_admin_host }}"
       changed_when: true
 
+# MANIFEST goes last: the next run trusts a matching manifest on the admin node
+# (files/deployed.sh), so it must never describe a half-copied bundle.
 - name: Sync the bundle (incremental)
   ansible.builtin.command:
-    argv: [rsync, -rlt, --delete, --itemize-changes, -e, "{{ _hpc_rsh }}",
+    argv: [rsync, -rlt, --delete, --itemize-changes, --exclude=/MANIFEST, -e, "{{ _hpc_rsh }}",
            "{{ hpc_bundle_dir }}/", "{{ _hpc_rtarget }}:{{ hpc_data_root }}/bundle/"]
   vars: {_h: "{{ hpc_admin_host }}"}
   register: _push
   changed_when: _push.stdout | length > 0
+  delegate_to: localhost
+
+- name: Bundle manifest, once the rest is there
+  ansible.builtin.command:
+    argv: [rsync, -t, --itemize-changes, -e, "{{ _hpc_rsh }}",
+           "{{ hpc_bundle_dir }}/MANIFEST", "{{ _hpc_rtarget }}:{{ hpc_data_root }}/bundle/MANIFEST"]
+  vars: {_h: "{{ hpc_admin_host }}"}
+  register: _push_manifest
+  changed_when: _push_manifest.stdout | length > 0
   delegate_to: localhost

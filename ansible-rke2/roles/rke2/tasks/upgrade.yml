@@ -1,0 +1,98 @@
+---
+# -e hpc_rke2_upgrade=true and this node has another RKE2 version than
+# hpc_rke2_version (newer or older). The server's play runs before the agents',
+# so the server changes first, as RKE2 requires. Before the server changes, an
+# etcd snapshot is saved and the old version is recorded in
+# /var/lib/hpc/rollback/state.json (copy: secrets/state/rollback.json);
+# rollback.yml -e hpc_rollback_mode=previous goes back to it (docs/rollback.md).
+- name: "{{ hpc_rke2_version }} is in the package repository"
+  ansible.builtin.command:
+    argv: [dnf, -q, list, --showduplicates, "{{ _rke2_svc }}-{{ _hpc_rke2_rpm_version }}"]
+  register: _avail
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+- name: Target version available
+  ansible.builtin.assert:
+    that: _avail.rc == 0
+    fail_msg: >-
+      {{ _rke2_svc }}-{{ _hpc_rke2_rpm_version }} is not in the node's repositories. Run bundle.yml
+      (it resolves the RPMs of hpc_rke2_version), or add the RPMs with import-rpms.sh, then retry.
+
+- name: Snapshot and record the version being replaced (server)
+  when: _rke2_server
+  block:
+    - name: RKE2 must be running to snapshot it
+      ansible.builtin.assert:
+        that: _active.rc == 0
+        fail_msg: "rke2-server is not running on {{ inventory_hostname }}: start it before changing the version"
+
+    - name: etcd snapshot before the change
+      ansible.builtin.command: /usr/bin/rke2 etcd-snapshot save --name hpc-pre-upgrade
+      changed_when: true
+
+    - name: Newest pre-upgrade snapshot
+      ansible.builtin.shell:
+        cmd: >-
+          find /var/lib/rancher/rke2/server/db/snapshots -maxdepth 1 -type f -name 'hpc-pre-upgrade-*'
+          -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-
+      register: _presnap
+      changed_when: false
+      check_mode: false
+      failed_when: _presnap.stdout | length == 0
+
+    # rke2 prunes its local snapshots; the backup directory keeps this one
+    # (named hpc-pre-upgrade-*, so the automatic restore never picks it).
+    - name: Copy the snapshot to the backup directory
+      ansible.builtin.copy:
+        src: "{{ _presnap.stdout }}"
+        dest: "{{ hpc_backup_dir }}/etcd/{{ _presnap.stdout | basename }}"
+        remote_src: true
+        mode: "0600"
+      when: hpc_backup_dir | length > 0
+
+    - name: Rancher chart version now running
+      ansible.builtin.shell:
+        cmd: "{{ hpc_helm }} -n cattle-system list -f '^rancher$' -o json 2>/dev/null || echo '[]'"
+      environment:
+        KUBECONFIG: /etc/rancher/rke2/rke2.yaml
+      register: _rancher_now
+      changed_when: false
+      check_mode: false
+
+    - name: Rollback record directory
+      ansible.builtin.file:
+        path: /var/lib/hpc/rollback
+        state: directory
+        mode: "0700"
+
+    - name: Rollback record
+      ansible.builtin.copy:
+        dest: /var/lib/hpc/rollback/state.json
+        mode: "0600"
+        content: "{{ _record | to_nice_json }}\n"
+      vars:
+        _record:
+          time: "{{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}"
+          rke2_from: "{{ 'v' ~ (_rke2_installed | replace('~', '+')) }}"
+          rke2_to: "{{ hpc_rke2_version }}"
+          rancher_from: "{{ ((_rancher_now.stdout | from_json | first | default({})).chart | default('')) | regex_replace('^rancher-', '') }}"
+          snapshot: "{{ _presnap.stdout }}"
+          snapshot_backup: "{{ (hpc_backup_dir ~ '/etcd/' ~ (_presnap.stdout | basename)) if hpc_backup_dir else '' }}"
+
+    - name: Copy of the record on the deployer
+      ansible.builtin.fetch:
+        src: /var/lib/hpc/rollback/state.json
+        dest: "{{ hpc_secrets_dir }}/state/rollback.json"
+        flat: true
+
+- name: "Install RKE2 {{ hpc_rke2_version }} (was {{ _rke2_installed }})"
+  ansible.builtin.dnf:
+    name: ["{{ _rke2_svc }}-{{ _hpc_rke2_rpm_version }}", "rke2-common-{{ _hpc_rke2_rpm_version }}"]
+    state: present
+    allow_downgrade: true
+
+- name: Restart with the new version
+  ansible.builtin.set_fact:
+    _rke2_version_changed: true

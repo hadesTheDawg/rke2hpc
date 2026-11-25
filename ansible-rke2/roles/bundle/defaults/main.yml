@@ -30,6 +30,40 @@ hpc_images_ceph:
   - registry.k8s.io/sig-storage/csi-resizer:v2.2.1
   - registry.k8s.io/sig-storage/csi-snapshotter:v8.6.0
 
+# Trivy operator (hpc_trivy_*_version), always bundled like Ceph, so it can be
+# switched on (hpc_enable_trivy) without a new bundle. docs/trivy.md.
+hpc_bundle_trivy: true
+hpc_images_trivy:
+  - "mirror.gcr.io/aquasec/trivy-operator:{{ hpc_trivy_operator_version }}"
+  - "mirror.gcr.io/aquasec/trivy:{{ hpc_trivy_version }}"
+  - "ghcr.io/aquasecurity/node-collector:{{ hpc_trivy_node_collector_version }}"
+# Vulnerability databases (OCI artifacts, not images). Their tags move: a new
+# DB is published upstream every few hours. -e hpc_trivy_db_refresh=true
+# downloads the current one and publishes it over the old.
+hpc_trivy_dbs: "{{ ['mirror.gcr.io/aquasec/trivy-db:2']
+                   + (['mirror.gcr.io/aquasec/trivy-java-db:1'] if hpc_trivy_java_db | bool else []) }}"
+
+# Harvester (docs/harvester.md). Off unless the site uses Harvester: the RKE2
+# image tarball with the Harvester cloud provider and CSI driver (guest
+# clusters), and Rancher's Harvester UI extension (chart + its files).
+hpc_bundle_harvester: "{{ hpc_enable_harvester | bool }}"
+_hpc_harvester_ui_base: https://raw.githubusercontent.com/harvester/harvester-ui-extension/gh-pages
+
+# Helm charts, downloaded into charts/ and served from the admin node as a
+# chart repository (docs/charts.md). Add your own with hpc_charts_extra:
+#   hpc_charts_extra:
+#     - https://example.org/charts/mychart-1.2.3.tgz
+hpc_charts: >-
+  {{ ['https://releases.rancher.com/server-charts/stable/rancher-' ~ hpc_rancher_version ~ '.tgz',
+      'https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner/releases/download/nfs-subdir-external-provisioner-'
+        ~ hpc_nfs_provisioner_chart_version ~ '/nfs-subdir-external-provisioner-' ~ hpc_nfs_provisioner_chart_version ~ '.tgz',
+      'https://ceph.github.io/csi-charts/cephfs/ceph-csi-cephfs-' ~ hpc_ceph_csi_chart_version ~ '.tgz']
+     + (['https://github.com/aquasecurity/helm-charts/releases/download/trivy-operator-' ~ hpc_trivy_operator_chart_version
+          ~ '/trivy-operator-' ~ hpc_trivy_operator_chart_version ~ '.tgz'] if hpc_bundle_trivy | bool else [])
+     + ([_hpc_harvester_ui_base ~ '/assets/harvester/harvester-' ~ hpc_harvester_ui_version ~ '.tgz'] if hpc_bundle_harvester | bool else [])
+     + hpc_charts_extra }}
+hpc_charts_extra: []
+
 # USER registry: images published read-only for projects.
 hpc_images_user:
   - docker.io/library/busybox:1.37
@@ -56,9 +90,11 @@ hpc_rpms:
   - bash-completion
   - bind-utils
   - python3
+  - createrepo_c                # indexes the site's own RPMs on the admin node (import-rpms.sh)
 hpc_rpms_extra: []
 
 hpc_bundle_fetch: true          # false: only push an existing bundle (no internet needed)
+hpc_bundle_force: false         # true: fetch and push even when the admin node already runs this bundle
 
 # rsync/ssh plumbing derived from the inventory (_h = target host)
 _hpc_rsh: >-
@@ -68,5 +104,10 @@ _hpc_rsh: >-
   {{ ('-i ' ~ hostvars[_h].ansible_ssh_private_key_file) if hostvars[_h].ansible_ssh_private_key_file is defined else '' }}
 _hpc_rtarget: "{{ (hostvars[_h].ansible_user ~ '@') if hostvars[_h].ansible_user is defined else '' }}{{ hostvars[_h].ansible_host | default(_h) }}"
 _hpc_kube_version: "{{ hpc_rke2_version.split('+')[0] }}"
-_hpc_rke2_rpm_version: "{{ hpc_rke2_version[1:] | replace('+', '~') }}"
+_hpc_rke2_tarballs: >-
+  {{ ['rke2-images-core.linux-' ~ hpc_arch ~ '.tar.zst', 'rke2-images-' ~ hpc_rke2_cni ~ '.linux-' ~ hpc_arch ~ '.tar.zst']
+     + (['rke2-images-harvester.linux-' ~ hpc_arch ~ '.tar.zst'] if hpc_bundle_harvester | bool else []) }}
+_hpc_system_refs: >-
+  {{ hpc_images_system + (hpc_images_ceph if hpc_bundle_ceph | bool else [])
+     + ((hpc_images_trivy + hpc_trivy_dbs) if hpc_bundle_trivy | bool else []) }}
 _hpc_rke2_url: "https://github.com/rancher/rke2/releases/download/{{ hpc_rke2_version | urlencode }}"

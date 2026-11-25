@@ -9,3 +9,11 @@ hpc_enable_ceph_csi: true
 # site CephFS mount (a disk that `lab.sh reprovision a1` keeps), so wiping a1
 # and re-running site.yml brings the cluster back (docs/reprovisioning.md).
 hpc_persist_root: /rhev/data-center/mnt/cephfs/hpc
+# Restart compute nodes one at a time when their RKE2 configuration changes.
+hpc_agent_batch: 1
+# Reports only; everything from the internal registries (docs/trivy.md).
+hpc_enable_trivy: true
+# Only the Rancher UI extension can be exercised in a VM lab (docs/harvester.md).
+hpc_enable_harvester: true
+# A second Keycloak realm plays the site's identity provider (docs/upstream-idp.md).
+hpc_upstream_oidc_spoof: true

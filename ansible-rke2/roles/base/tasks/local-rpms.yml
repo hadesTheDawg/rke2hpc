@@ -1,0 +1,128 @@
+---
+# The site's own RPMs (docs/rpms.md). On the deployer they are plain files in
+# hpc_local_rpms_dir (import-rpms.sh puts them there). The admin node keeps a
+# copy in <data root>/local-rpms, checks each package, indexes the directory
+# (createrepo_c) and serves it at https://<admin>:<repo port>/local/. Every node
+# gets the repository "hpc-local". No RPMs: no repository.
+- name: Repository on the admin node
+  when: inventory_hostname == hpc_admin_host and _hpc_local_rpms | length > 0
+  block:
+    # owned by the ssh user, so the copy needs no passwordless sudo (like the bundle)
+    - name: Directory
+      ansible.builtin.file:
+        path: "{{ hpc_data_root }}/local-rpms"
+        state: directory
+        owner: "{{ hostvars[hpc_admin_host].ansible_facts.user_id }}"
+        mode: "0755"
+
+    # repodata is made on the admin node and never copied (nor deleted) by rsync
+    - name: Sync the RPMs
+      ansible.builtin.command:
+        argv: [rsync, -rlt, --delete, --itemize-changes, "--include=*.rpm", "--include=/{{ hpc_local_rpms_gpgkey or '.none' }}",
+               "--exclude=/repodata/", "--exclude=*", -e, "{{ _rsh }}",
+               "{{ hpc_local_rpms_dir }}/", "{{ _rtarget }}:{{ hpc_data_root }}/local-rpms/"]
+      vars:
+        _h: "{{ hpc_admin_host }}"
+        _rsh: >-
+          ssh -o BatchMode=yes -o LogLevel=ERROR
+          {{ hostvars[_h].ansible_ssh_common_args | default('') }}
+          {{ ('-p ' ~ hostvars[_h].ansible_port) if hostvars[_h].ansible_port is defined else '' }}
+          {{ ('-i ' ~ hostvars[_h].ansible_ssh_private_key_file) if hostvars[_h].ansible_ssh_private_key_file is defined else '' }}
+        _rtarget: "{{ (hostvars[_h].ansible_user ~ '@') if hostvars[_h].ansible_user is defined else '' }}{{ hostvars[_h].ansible_host | default(_h) }}"
+      register: _lsync
+      changed_when: _lsync.stdout | length > 0
+      delegate_to: localhost
+      become: false
+
+    # Each file must be a binary RPM for the nodes' architecture (or noarch)
+    # with intact digests; with hpc_local_rpms_gpgkey also a valid signature.
+    - name: Check the packages
+      ansible.builtin.shell:
+        cmd: |
+          set -u; bad=0
+          {% if hpc_local_rpms_gpgkey %}
+          rpmkeys --import "{{ hpc_local_rpms_gpgkey }}" || { echo "cannot import {{ hpc_local_rpms_gpgkey }}"; exit 1; }
+          {% endif %}
+          for f in *.rpm; do
+            a=$(rpm -qp --nosignature --qf '%{ARCH}' "$f" 2>/dev/null) || { echo "$f: not an RPM package"; bad=1; continue; }
+            case "$a" in {{ hpc_rpm_arch }}|noarch) ;; *) echo "$f: architecture $a, the nodes are {{ hpc_rpm_arch }}"; bad=1; continue ;; esac
+            [ "$(rpm -qp --nosignature --qf '%{SOURCERPM}' "$f")" != "(none)" ] || { echo "$f: source package"; bad=1; continue; }
+            out=$(rpm -K {{ '' if hpc_local_rpms_gpgkey else '--nosignature' }} "$f" 2>&1) || { echo "$out"; bad=1; }
+          done
+          exit $bad
+        chdir: "{{ hpc_data_root }}/local-rpms"
+      register: _lcheck
+      changed_when: false
+      check_mode: false
+      failed_when: false
+
+    - name: Bad packages
+      ansible.builtin.fail:
+        msg: >-
+          {{ _lcheck.stdout_lines | join('; ') }}. Remove or replace them in {{ hpc_local_rpms_dir }}
+          (./import-rpms.sh --remove <file>) and run again.
+      when: _lcheck.rc != 0
+
+    - name: createrepo_c
+      ansible.builtin.dnf:
+        name: createrepo_c
+        state: present
+
+    - name: Repository index
+      ansible.builtin.stat:
+        path: "{{ hpc_data_root }}/local-rpms/repodata/repomd.xml"
+      register: _lrepomd
+
+    - name: Index the repository
+      ansible.builtin.command:
+        argv: [createrepo_c, -q, --update, "{{ hpc_data_root }}/local-rpms"]
+      when: _lsync.changed or not _lrepomd.stat.exists
+      changed_when: true
+
+    - name: SELinux label for served content
+      ansible.builtin.shell:
+        cmd: |
+          t={{ hpc_data_root }}/local-rpms
+          semanage fcontext -a -t httpd_sys_content_t "$t(/.*)?" 2>/dev/null \
+            || semanage fcontext -m -t httpd_sys_content_t "$t(/.*)?"
+          restorecon -R "$t"
+      changed_when: false
+
+- name: hpc-local repository definition
+  ansible.builtin.copy:
+    dest: /etc/yum.repos.d/hpc-local.repo
+    mode: "0644"
+    content: |
+      # managed by ansible (hpc base): the site's own RPMs (import-rpms.sh)
+      [hpc-local]
+      name=HPC site packages (admin node)
+      baseurl={{ _url }}
+      enabled=1
+      gpgcheck={{ 1 if hpc_local_rpms_gpgkey else 0 }}
+      {% if hpc_local_rpms_gpgkey %}
+      gpgkey={{ _url }}/{{ hpc_local_rpms_gpgkey }}
+      {% endif %}
+      metadata_expire=60
+  vars:
+    _url: "{{ ('file://' ~ hpc_data_root ~ '/local-rpms') if inventory_hostname == hpc_admin_host
+              else ('https://' ~ hpc_admin_host ~ '.' ~ hpc_domain ~ ':' ~ hpc_repo_port ~ '/local') }}"
+  register: _lrepo
+  when: _hpc_local_rpms | length > 0
+
+- name: No site RPMs, no hpc-local repository
+  ansible.builtin.file:
+    path: /etc/yum.repos.d/hpc-local.repo
+    state: absent
+  when: _hpc_local_rpms | length == 0
+
+# dnf would otherwise keep using its cached index for up to a minute
+- name: Fresh index of the site RPMs
+  ansible.builtin.command: dnf -q makecache --repo hpc-local
+  when: _hpc_local_rpms | length > 0 and (_lrepo.changed or (hostvars[hpc_admin_host]._lsync.changed | default(false)))
+  changed_when: false
+
+- name: Site packages
+  ansible.builtin.dnf:
+    name: "{{ hpc_local_packages + (hpc_local_packages_admin if inventory_hostname == hpc_admin_host else hpc_local_packages_compute) }}"
+    state: present
+  when: (hpc_local_packages + (hpc_local_packages_admin if inventory_hostname == hpc_admin_host else hpc_local_packages_compute)) | length > 0

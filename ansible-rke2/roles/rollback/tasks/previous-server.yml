@@ -1,0 +1,95 @@
+---
+# Admin node, after previous-plan.yml: restore _rb_snapshot with RKE2 _rb_version.
+# Pods on the admin node restart; pods on compute nodes keep running.
+- name: Is rke2-server running
+  ansible.builtin.command: systemctl is-active rke2-server
+  register: _rb_active
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+# so this rollback can itself be undone (-e hpc_rollback_snapshot=hpc-pre-rollback-...)
+- name: Snapshot of the current state
+  when: _rb_active.rc == 0
+  block:
+    - name: etcd snapshot hpc-pre-rollback
+      ansible.builtin.command: /usr/bin/rke2 etcd-snapshot save --name hpc-pre-rollback
+      changed_when: true
+    - name: Newest hpc-pre-rollback snapshot
+      ansible.builtin.shell:
+        cmd: >-
+          find /var/lib/rancher/rke2/server/db/snapshots -maxdepth 1 -type f -name 'hpc-pre-rollback-*'
+          -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-
+      register: _rb_pre
+      changed_when: false
+      check_mode: false
+    - name: Keep it in the backup directory
+      ansible.builtin.copy:
+        src: "{{ _rb_pre.stdout }}"
+        dest: "{{ hpc_backup_dir }}/etcd/{{ _rb_pre.stdout | basename }}"
+        remote_src: true
+        mode: "0600"
+      when: hpc_backup_dir | length > 0 and _rb_pre.stdout | length > 0
+
+# rke2 runs SELinux-confined and restores only from its own snapshot directory
+- name: Snapshot on local disk
+  ansible.builtin.copy:
+    src: "{{ _rb_snapshot }}"
+    dest: "/var/lib/rancher/rke2/server/db/snapshots/{{ _rb_snapshot | basename }}"
+    remote_src: true
+    mode: "0600"
+  when: (_rb_snapshot | dirname) != '/var/lib/rancher/rke2/server/db/snapshots'
+
+- name: Stop RKE2 and every container on the admin node
+  ansible.builtin.shell:
+    cmd: |
+      systemctl stop rke2-server
+      /usr/bin/rke2-killall.sh >/dev/null 2>&1 || true
+  changed_when: true
+
+- name: "RKE2 {{ _rb_version }}"
+  ansible.builtin.dnf:
+    name: ["rke2-server-{{ _rb_rpm_version }}", "rke2-common-{{ _rb_rpm_version }}"]
+    state: present
+    allow_downgrade: true
+  when: _rb_change | bool
+
+- name: Cluster reset from the snapshot (starts etcd once, then exits)
+  ansible.builtin.command:
+    argv: [timeout, "1200", /usr/bin/rke2, server, --cluster-reset,
+           "--cluster-reset-restore-path=/var/lib/rancher/rke2/server/db/snapshots/{{ _rb_snapshot | basename }}"]
+  register: _rb_reset
+  changed_when: true
+  failed_when: >-
+    _rb_reset.rc != 0 and
+    'restart without --cluster-reset' not in (_rb_reset.stdout ~ _rb_reset.stderr)
+
+- name: Start RKE2
+  ansible.builtin.systemd_service:
+    name: rke2-server
+    state: started
+
+- name: kube-apiserver answers
+  ansible.builtin.command: "{{ hpc_kubectl }} get --raw /readyz"
+  register: _rb_readyz
+  until: _rb_readyz.rc == 0
+  retries: 120
+  delay: 5
+  changed_when: false
+  check_mode: false
+
+- name: Record the rollback
+  ansible.builtin.copy:
+    dest: /var/lib/hpc/rollback/state.json
+    mode: "0600"
+    content: "{{ _rb_state | combine({'rolled_back': now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ'),
+                                      'rolled_back_to': _rb_snapshot | basename,
+                                      'rolled_back_version': _rb_version}) | to_nice_json }}\n"
+  when: _rb_state.time is defined
+
+- name: Copy of the record on the deployer
+  ansible.builtin.fetch:
+    src: /var/lib/hpc/rollback/state.json
+    dest: "{{ hpc_secrets_dir }}/state/rollback.json"
+    flat: true
+  when: _rb_state.time is defined

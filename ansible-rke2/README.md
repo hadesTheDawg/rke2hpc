@@ -41,7 +41,7 @@ $EDITOR inventories/mysite/hosts.yml           # admin node, compute nodes, rpm_
 $EDITOR inventories/mysite/group_vars/all.yml  # domain, interfaces, storage
 $EDITOR inventories/mysite/projects.txt        # the flat file
 
-python3 roles/tenants/files/hpc_flatfile.py check inventories/mysite/projects.txt
+./check.sh inventories/mysite/hosts.yml                        # syntax, flat file, scripts (no node touched)
 ansible-playbook -i inventories/mysite/hosts.yml site.yml      # ~20 min the first time
 ansible-playbook -i inventories/mysite/hosts.yml verify.yml    # acceptance checks
 ```
@@ -55,26 +55,58 @@ If the cluster manager can wipe nodes, set `hpc_persist_root`
 
 | Playbook | Use |
 |----------|-----|
-| `site.yml` | Everything, in order. Idempotent; re-run any time. `--tags rke2,platform` etc. for parts. |
-| `bundle.yml` | Download and push the offline bundle only (`-e hpc_bundle_fetch=false`: push only). |
+| `site.yml` | Everything, in order. `--check --diff` previews a run on a deployed site ([operations.md](docs/operations.md)). Idempotent; re-run any time. `--tags rke2,platform` etc. for parts. On a deployed site it skips the bundle and never reinstalls RKE2 ([variables.md](docs/variables.md#bundle-packages-versions)). |
+| `bundle.yml` | Download and push the offline bundle only (`-e hpc_bundle_fetch=false`: push only; `-e hpc_bundle_force=true`: even if deployed). |
 | `tenants.yml` | Apply an edited flat file. |
 | `verify.yml` | Acceptance checks, run as real users (needs `hpc_keycloak_allow_password_grant: true`). |
 | `acct.yml` | Accounting reports: `-e 'acct="jobs --project BS0001"'`. |
+| `rpms.yml` | Publish your own RPMs (`inventories/<site>/rpms/`) to every node; `./import-rpms.sh` copies them there and runs it ([docs/rpms.md](docs/rpms.md)). |
+| `rollback.yml` | `-e hpc_rollback_mode=list\|previous\|uninstall`: restore points, go back to before the last version change or to a snapshot, or uninstall ([docs/rollback.md](docs/rollback.md)). |
 
-Credentials: `inventories/<site>/secrets/rancher-admin` (Rancher `admin`),
-`keycloak-admin` (Keycloak `admin`), `users/<name>` (initial password of each
-user and of the platform admin `opsadmin`).
+## Secrets
+
+Everything generated for a site lives in `inventories/<site>/secrets/`
+(git-ignored, mode 0700):
+
+| Path | |
+|------|-|
+| `rancher-admin`, `keycloak-admin` | passwords of Rancher `admin` and Keycloak `admin` |
+| `users/<name>` | initial password of each user and of the platform admin `opsadmin` |
+| `registry-*`, `rke2-*`, `*-oidc-client`, `keycloak-db` | internal passwords and tokens |
+| `pki/` | CA and service certificates |
+| `pki/own/` | **your own certificates** (`ingress.crt`/`.key`, `admin.*`, `apps.*`) and the CA chain that signed them (`ca.crt`); used as they are instead of issued ones |
+| `state/` | uid/gid map, account list, rollback record |
+
+To use your own `.crt` (e.g. for Rancher and Keycloak), or to issue
+everything from your site CA, see
+**[docs/certificates.md](docs/certificates.md)**. In short:
+
+```sh
+cd inventories/<site>/secrets/pki && mkdir -p own && chmod 700 own
+cp rancher.example.org.crt own/ingress.crt    # certificate + intermediates, PEM
+cp rancher.example.org.key own/ingress.key    # unencrypted key
+cat intermediate.crt root.crt > own/ca.crt     # the chain that signed it
+cd - && ansible-playbook -i inventories/<site>/hosts.yml site.yml   # checks and installs them
+```
 
 ## Documentation
 
 | | |
 |-|-|
+| [docs/certificates.md](docs/certificates.md) | The secrets directory; using your own `.crt` files or your site CA |
+| [docs/rpms.md](docs/rpms.md) | Importing your own RPMs (`import-rpms.sh`) and installing them on the nodes |
+| [docs/rollback.md](docs/rollback.md) | Version changes, going back to a snapshot or the previous version, uninstalling |
 | [docs/networking.md](docs/networking.md) | bond0 / HSN split: what goes where, and how it is configured and checked |
 | [docs/flatfile.md](docs/flatfile.md) | The flat file, and how to add/remove columns (e.g. drop CPU_HOURS) |
 | [docs/ceph.md](docs/ceph.md) | CephFS CSI: what the registry carries, turning it on, homes on CephFS |
 | [docs/variables.md](docs/variables.md) | Every setting and where it is defined |
 | [docs/extending.md](docs/extending.md) | Switching components off, replacing them, adding new ones |
 | [docs/reprovisioning.md](docs/reprovisioning.md) | Nodes wiped by the cluster manager (HPCM): fixed node passwords, admin node state on CephFS, etcd backup and automatic restore |
+| [docs/operations.md](docs/operations.md) | `check.sh`, dry runs, compute nodes in batches, failed nodes, `--limit`, run logs |
+| [docs/charts.md](docs/charts.md) | Every Helm chart from the bundle, served as a chart repository and Rancher catalog |
+| [docs/upstream-idp.md](docs/upstream-idp.md) | Keycloak brokering the site's identity provider, from a `.well-known` URL or a saved openid-configuration file |
+| [docs/trivy.md](docs/trivy.md) | Trivy operator: vulnerability and configuration reports, offline DB, refreshing it |
+| [docs/harvester.md](docs/harvester.md) | Harvester: Rancher UI extension, guest clusters on Harvester VMs (bundled; not lab-tested) |
 | [docs/lab-testing.md](docs/lab-testing.md) | The QEMU lab used to test this, and what was verified |
 | [docs/accounting.md](docs/accounting.md) | Usage accounting (measures only, enforces nothing) |
 
@@ -101,3 +133,7 @@ users/groups with their uids/gids):
   uid/gid with their NFS home mounted.
 - **Accounting**: job ids, users, elapsed time, CPU-hours per project.
 - **Storage**: NFS StorageClass from the admin node, and/or CephFS CSI.
+- **Charts**: every Helm chart served from the admin node as a chart
+  repository, and a Rancher catalog of it.
+- Optional: an **upstream identity provider** brokered by Keycloak, the
+  **Trivy operator** (reports only), **Harvester** integration.

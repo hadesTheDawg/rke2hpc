@@ -13,6 +13,8 @@
       $k create secret tls tls-rancher-ingress --cert=/etc/pki/hpc/ingress.crt --key=/etc/pki/hpc/ingress.key \
         --dry-run=client -o yaml | $k apply -f -
       $k create secret generic tls-ca --from-file=cacerts.pem=/etc/pki/hpc/ca.crt --dry-run=client -o yaml | $k apply -f -
+      # trusted for Rancher's own outgoing connections too (chart repository, UI extensions)
+      $k create secret generic tls-ca-additional --from-file=ca-additional.pem=/etc/pki/hpc/ca.crt --dry-run=client -o yaml | $k apply -f -
   register: _rsec
   changed_when: "'configured' in _rsec.stdout or 'created' in _rsec.stdout"
 
@@ -25,6 +27,7 @@
       replicas: 1
       bootstrapPassword: "{{ hpc_rancher_admin_password }}"
       privateCA: true
+      additionalTrustedCAs: true
       ingress:
         ingressClassName: traefik
         tls:
@@ -35,16 +38,27 @@
   no_log: true
 
 - name: Rancher
-  ansible.builtin.command: >-
-    {{ hpc_helm }} upgrade --install rancher {{ hpc_data_root }}/bundle/charts/rancher-{{ hpc_rancher_version }}.tgz
-    --namespace cattle-system --wait --timeout 15m -f /etc/hpc/rancher-values.yaml
-  environment:
-    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
-  changed_when: true
+  ansible.builtin.command:
+    argv:
+      - /usr/local/libexec/hpc/hpc-helm-release
+      - cattle-system
+      - rancher
+      - "{{ hpc_data_root }}/bundle/charts/rancher-{{ hpc_rancher_version }}.tgz"
+      - /etc/hpc/rancher-values.yaml
+      - 15m
+  register: _rrel
+  changed_when: "'deployed' in _rrel.stdout"
 
 - name: Rollout
   ansible.builtin.command: "{{ hpc_kubectl }} -n cattle-system rollout status deployment/rancher --timeout=900s"
   changed_when: false
+  check_mode: false
+
+# Rancher reads the CA bundle (tls-ca, used to trust Keycloak) only at start.
+- name: Restart Rancher if the trusted CAs changed since it started
+  ansible.builtin.command: /usr/local/libexec/hpc/hpc-restart-if-stale cattle-system rancher /etc/pki/hpc/ca.crt
+  register: _rstale
+  changed_when: "'restarted' in _rstale.stdout"
 
 # The deployment owns the admin password (secrets/rancher-admin): skip the
 # interactive first-login steps.
@@ -57,6 +71,7 @@
   retries: 60
   delay: 5
   changed_when: false
+  check_mode: false
 
 - name: First-login settings
   ansible.builtin.shell:
@@ -74,6 +89,7 @@
   until: _ping is succeeded
   retries: 60
   delay: 5
+  check_mode: false
 
 # Rancher installs its own components (webhook, fleet, cluster-api, ...)
 # through helm jobs after it starts. Wait for them, then pin their namespaces.
@@ -90,6 +106,7 @@
       echo "Rancher is still installing components; re-run to pin them"
   register: _settle
   changed_when: false
+  check_mode: false
 
 - name: Settle result
   ansible.builtin.debug:
@@ -100,3 +117,35 @@
   ansible.builtin.include_role:
     name: hpc_common
     tasks_from: pin-namespaces
+
+# The bundle's charts as a catalog in Rancher (Apps), served by the admin node
+# (docs/charts.md). Rancher trusts the site CA through additionalTrustedCAs
+# (spec.caBundle would take a single DER certificate, not the PEM bundle). Rancher's default catalogs point at the internet and stay
+# unreachable on an offline site.
+- name: Local chart repository in Rancher
+  when: hpc_enable_charts_repo | bool
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      {{ hpc_kubectl }} apply -f - <<YAML
+      apiVersion: catalog.cattle.io/v1
+      kind: ClusterRepo
+      metadata:
+        name: {{ hpc_charts_rancher_repo }}
+      spec:
+        url: {{ hpc_charts_url }}/
+      YAML
+  register: _crepo
+  changed_when: "'configured' in _crepo.stdout or 'created' in _crepo.stdout"
+
+- name: Rancher read the local chart repository
+  ansible.builtin.command:
+    argv: "{{ hpc_kubectl.split() + ['get', 'clusterrepo', hpc_charts_rancher_repo,
+            '-o', 'jsonpath={.status.conditions[?(@.type==\"Downloaded\")].status}'] }}"
+  register: _crepo_ok
+  until: _crepo_ok.stdout == 'True'
+  retries: 30
+  delay: 5
+  changed_when: false
+  check_mode: false
+  when: hpc_enable_charts_repo | bool and not ansible_check_mode

@@ -1,0 +1,129 @@
+---
+# Every selected node: remove RKE2 and the node baseline (base role) and put
+# back what they replaced. Packages other than RKE2 stay installed.
+- name: RKE2 uninstall script
+  ansible.builtin.stat:
+    path: /usr/bin/rke2-uninstall.sh
+  register: _rb_un
+
+# stops RKE2 and every container, removes the rke2-* RPMs, /etc/rancher/rke2,
+# /var/lib/rancher/rke2 (etcd on the server), kubelet and CNI state
+- name: Uninstall RKE2
+  ansible.builtin.command: timeout 900 /usr/bin/rke2-uninstall.sh
+  register: _rb_unout
+  when: _rb_un.stat.exists
+  changed_when: true
+  failed_when: _rb_unout.rc != 0
+
+- name: RKE2 leftovers and files of the rke2 role
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/rancher/rke2
+    - /etc/rancher/node
+    - /etc/NetworkManager/conf.d/rke2-canal.conf
+    - /etc/profile.d/hpc-kube.sh
+    - /usr/local/bin/kubectl
+    - /usr/local/bin/helm
+  register: _rb_rm
+
+- name: Reload NetworkManager
+  ansible.builtin.systemd_service:
+    name: NetworkManager
+    state: reloaded
+  when: _rb_rm.results[2].changed
+
+# ---- package repositories ---------------------------------------------------------
+- name: Repositories of the deployment
+  ansible.builtin.file:
+    path: "/etc/yum.repos.d/{{ item }}"
+    state: absent
+  loop: [hpc-offline.repo, hpc-local.repo]
+
+- name: Repositories the base role disabled
+  ansible.builtin.slurp:
+    src: /var/lib/hpc/base/disabled-repos
+  register: _rb_disabled
+  failed_when: false
+
+- name: Enable them again
+  ansible.builtin.shell:
+    cmd: |
+      while IFS= read -r f; do
+        [ -f "$f" ] && sed -i 's/^enabled=0/enabled=1/' "$f" && echo "enabled $f"
+      done </var/lib/hpc/base/disabled-repos
+  register: _rb_enabled
+  changed_when: _rb_enabled.stdout | length > 0
+  when: _rb_disabled.content is defined
+
+- name: Disabled repositories not recorded
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ inventory_hostname }} was set up before disabled repositories were recorded.
+      Enable the distro repositories in /etc/yum.repos.d by hand (enabled=1) if the node needs them.
+  when: _rb_disabled.content is not defined and (hpc_offline | bool) and (hpc_offline_repo | bool)
+
+# ---- names, trust, time -------------------------------------------------------------
+- name: Cluster names in /etc/hosts
+  ansible.builtin.blockinfile:
+    path: /etc/hosts
+    marker: "# {mark} hpc managed"
+    state: absent
+
+- name: Site CA out of the trust store
+  ansible.builtin.file:
+    path: /etc/pki/ca-trust/source/anchors/hpc-ca.crt
+    state: absent
+  register: _rb_ca
+
+- name: Update the trust store
+  ansible.builtin.command: update-ca-trust extract
+  when: _rb_ca.changed
+
+- name: Original chrony.conf
+  ansible.builtin.stat:
+    path: /var/lib/hpc/base/orig/etc/chrony.conf
+  register: _rb_chrony
+
+- name: Put the original chrony.conf back
+  ansible.builtin.copy:
+    src: /var/lib/hpc/base/orig/etc/chrony.conf
+    dest: /etc/chrony.conf
+    remote_src: true
+    mode: preserve
+  register: _rb_chrony_put
+  when: _rb_chrony.stat.exists
+
+- name: Restart chronyd
+  ansible.builtin.systemd_service:
+    name: chronyd
+    state: restarted
+  when: _rb_chrony_put.changed
+
+- name: chrony.conf not recorded
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ inventory_hostname }}: no original chrony.conf was kept (set up before it was recorded); /etc/chrony.conf
+      still {{ 'serves time to the cluster' if inventory_hostname == hpc_admin_host else 'follows ' ~ hpc_admin_host }}. Edit it by hand.
+  when: not _rb_chrony.stat.exists and (hpc_manage_time | bool)
+
+# (the admin node still needs them for nginx.conf: uninstall-admin.yml removes them there)
+- name: Records of the base role
+  ansible.builtin.file:
+    path: /var/lib/hpc/base
+    state: absent
+  when: inventory_hostname != hpc_admin_host
+
+# ---- compute node leaves a cluster that stays ---------------------------------------
+- name: Remove the node from the cluster
+  ansible.builtin.shell:
+    cmd: |
+      k="{{ hpc_kubectl }}"
+      systemctl is-active --quiet rke2-server || { echo "rke2-server not running"; exit 0; }
+      $k delete node {{ inventory_hostname }} --ignore-not-found
+      $k -n kube-system delete secret {{ inventory_hostname }}.node-password.rke2 --ignore-not-found
+  delegate_to: "{{ hpc_admin_host }}"
+  register: _rb_delnode
+  changed_when: "'deleted' in _rb_delnode.stdout"
+  when: inventory_hostname != hpc_admin_host and hpc_admin_host not in ansible_play_hosts_all

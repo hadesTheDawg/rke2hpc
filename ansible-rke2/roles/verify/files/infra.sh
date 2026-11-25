@@ -22,11 +22,26 @@ misplaced=$($KUBECTL get pods -A --field-selector=status.phase=Running -o jsonpa
   | awk -v a="$ADMIN_NAME" -v skip=" $UNPINNED_NAMESPACES " 'index(skip, " " $1 " ")==0 && $2!=a {print $1}' | sort -u \
   | while read -r ns; do [ "$($KUBECTL get ns "$ns" -o jsonpath='{.metadata.labels.hpc\.io/tenant}')" = true ] || echo "$ns"; done)
 t  "platform pods run only on the admin node"           test -z "$misplaced"
-unhealthy=$($KUBECTL get pods -A --no-headers | grep -v -E 'Running|Completed' || true)
+# Trivy scan jobs come and go (they start pending while their image is pulled).
+unhealthy=$($KUBECTL get pods -A --no-headers | grep -v -E 'Running|Completed' \
+  | grep -v -E "^$TRIVY_NS +scan-[a-z]+-[0-9a-z-]+ +[0-9]+/[0-9]+ +(Pending|ContainerCreating|PodInitializing|Init:)" || true)
 t  "no failing pods"                                    test -z "$unhealthy"
 if [ -n "$STORAGE_CLASS" ]; then
 t  "default StorageClass '$STORAGE_CLASS' present"       sh -c "$KUBECTL get sc $STORAGE_CLASS -o jsonpath='{.metadata.annotations}' | grep -q 'is-default-class\":\"true'"
 fi
+# ---- certificates: each endpoint serves the certificate installed from secrets/pki
+# (issued, or the site's own from pki/own; docs/certificates.md)
+served_fp() { openssl s_client -connect "$1" -servername "$2" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256; }
+file_fp()   { openssl x509 -in "/etc/pki/hpc/$1.crt" -noout -fingerprint -sha256; }
+serves()    { [ -n "$(file_fp "$3")" ] && [ "$(served_fp "$1" "$2")" = "$(file_fp "$3")" ]; }
+issuer()    { openssl x509 -in "/etc/pki/hpc/$1.crt" -noout -issuer | sed 's/^issuer=//'; }
+t  "system registry serves the admin certificate ($(issuer admin))"  serves "$sys" "$REGISTRY_SYSTEM_HOST" admin
+t  "user registry serves the admin certificate"                       serves "$usr" "$REGISTRY_USER_HOST" admin
+t  "registry push endpoints serve the loopback certificate"          serves "127.0.0.1:$REGISTRY_SYSTEM_RW_PORT" localhost local
+[ -z "$REPO_PORT" ] || t "package repository serves the admin certificate" serves "$ADMIN_NAME.$CLUSTER_DOMAIN:$REPO_PORT" "$ADMIN_NAME.$CLUSTER_DOMAIN" admin
+t  "Keycloak serves the ingress certificate ($(issuer ingress))"     serves "$KEYCLOAK_HOST:443" "$KEYCLOAK_HOST" ingress
+[ "$RANCHER_ENABLED" = true ] && t "Rancher serves the ingress certificate" serves "$RANCHER_HOST:443" "$RANCHER_HOST" ingress
+t  "the nodes trust every CA in the bundle"                          sh -c "openssl verify -CAfile /etc/pki/tls/certs/ca-bundle.crt -untrusted /etc/pki/hpc/ingress.crt /etc/pki/hpc/ingress.crt"
 t  "kube-apiserver trusts the Keycloak realm (OIDC discovery)" curl -fsS "https://$KEYCLOAK_HOST/realms/$KEYCLOAK_REALM/.well-known/openid-configuration"
 
 # ---- networks: node IP on management, pod overlay on the pod interface -------------

@@ -1,7 +1,7 @@
 ---
 # ---- repo server (nginx, TLS) ------------------------------------------------
 - name: Repository server
-  when: hpc_offline_repo | bool
+  when: _hpc_nginx | bool
   block:
     - name: Packages
       ansible.builtin.dnf:
@@ -18,27 +18,82 @@
         dest: "{{ hpc_data_root }}/www/ca.crt"
         remote_src: true
         mode: "0644"
+    - name: Served directories
+      ansible.builtin.file:
+        path: "{{ hpc_data_root }}/{{ item }}"
+        state: directory
+        mode: "0755"
+      loop: "{{ (['charts'] if hpc_enable_charts_repo | bool else []) + (['ui-plugins'] if _hpc_ui_plugins | bool else []) }}"
     - name: SELinux label for served content
       ansible.builtin.shell:
         cmd: |
-          for t in {{ hpc_data_root }}/www {{ hpc_data_root }}/bundle/rpms; do
-            semanage fcontext -a -t httpd_sys_content_t "$t(/.*)?" 2>/dev/null \
-              || semanage fcontext -m -t httpd_sys_content_t "$t(/.*)?"
+          set -e
+          for t in {{ _hpc_served | join(' ') }}; do
+            [ -n "$(semanage fcontext -l -C | awk -v p="$t(/.*)?" '$1==p && /httpd_sys_content_t/')" ] \
+              || { semanage fcontext -a -t httpd_sys_content_t "$t(/.*)?" 2>/dev/null \
+                   || semanage fcontext -m -t httpd_sys_content_t "$t(/.*)?"; echo "labelled $t"; }
             restorecon -R "$t"
           done
-      changed_when: false
+      vars:
+        _hpc_served: >-
+          {{ [hpc_data_root ~ '/www']
+             + ([hpc_data_root ~ '/bundle/rpms'] if hpc_offline_repo | bool else [])
+             + ([hpc_data_root ~ '/charts'] if hpc_enable_charts_repo | bool else [])
+             + ([hpc_data_root ~ '/ui-plugins'] if _hpc_ui_plugins | bool else []) }}
+      register: _label
+      changed_when: _label.stdout | length > 0
+    - name: Chart repository (docs/charts.md)
+      when: hpc_enable_charts_repo | bool
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          d={{ hpc_data_root }}/charts
+          out=$(rsync -rt --delete --itemize-changes --exclude=/index.yaml {{ hpc_data_root }}/bundle/charts/ "$d/")
+          if [ -n "$out" ] || [ ! -s "$d/index.yaml" ] || ! grep -qF "{{ hpc_charts_url }}/" "$d/index.yaml"; then
+            {{ hpc_data_root }}/bundle/bin/helm repo index "$d" --url "{{ hpc_charts_url }}"
+            restorecon -R "$d"
+            echo "indexed: $(find "$d" -maxdepth 1 -name '*.tgz' | wc -l) charts"
+          fi
+      register: _charts
+      changed_when: _charts.stdout | length > 0
+    - name: Rancher UI extension files (Harvester)
+      when: _hpc_ui_plugins | bool
+      ansible.builtin.shell:
+        cmd: |
+          set -euo pipefail
+          d={{ hpc_data_root }}/ui-plugins/harvester v={{ hpc_harvester_ui_version }}
+          src={{ hpc_data_root }}/bundle/ui-plugins/harvester-$v.tgz
+          [ -s "$src" ] || { echo "missing $src (bundle built without hpc_enable_harvester)" >&2; exit 1; }
+          if ! cmp -s "$src" "$d/$v.tgz" || [ ! -s "$d/$v/plugin/harvester-$v.umd.min.js" ]; then
+            mkdir -p "$d"; rm -rf "$d/$v"
+            tar -xzf "$src" -C "$d"
+            cp -f "$src" "$d/$v.tgz"
+            restorecon -R "$d"
+            echo "unpacked harvester $v"
+          fi
+      register: _uiplug
+      changed_when: _uiplug.stdout | length > 0
+    - name: Original nginx.conf
+      ansible.builtin.include_tasks: keep-original.yml
+      vars: {_keep: /etc/nginx/nginx.conf}
     - name: nginx.conf
       ansible.builtin.template:
         src: nginx.conf.j2
         dest: /etc/nginx/nginx.conf
         mode: "0644"
         validate: nginx -t -q -c %s
-      register: _nginx
+      notify: Restart nginx
+    - name: Certificates changed
+      ansible.builtin.debug:
+        msg: "certificates changed: nginx restarts at the end of this play"
+      changed_when: _hpc_certs.changed
+      notify: Restart nginx
+      when: _hpc_certs.changed
     - name: nginx running
       ansible.builtin.systemd_service:
         name: nginx
         enabled: true
-        state: "{{ 'restarted' if _nginx.changed else 'started' }}"
+        state: started
 
 # ---- DNS for the cluster domain ------------------------------------------------
 # Containers do not read /etc/hosts, so the service names must resolve through
@@ -82,6 +137,9 @@
       ansible.builtin.dnf:
         name: chrony
         state: present
+    - name: Original chrony.conf
+      ansible.builtin.include_tasks: keep-original.yml
+      vars: {_keep: /etc/chrony.conf}
     - name: chrony.conf
       ansible.builtin.copy:
         dest: /etc/chrony.conf
@@ -99,9 +157,9 @@
           makestep 1.0 3
           rtcsync
           logdir /var/log/chrony
-      register: _chrony
+      notify: Restart chronyd
     - name: chronyd running
       ansible.builtin.systemd_service:
         name: chronyd
         enabled: true
-        state: "{{ 'restarted' if _chrony.changed else 'started' }}"
+        state: started

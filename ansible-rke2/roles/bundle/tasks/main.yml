@@ -1,9 +1,45 @@
 ---
-- name: Fetch the bundle
-  ansible.builtin.include_tasks: fetch.yml
-  when: hpc_bundle_fetch | bool
+# The bundle is fetched and pushed only when the admin node does not already
+# run it: same manifest on the admin node, registries and the cluster's system
+# pods running (files/deployed.sh). A re-run of an installed
+# site then needs neither internet nor the rpm_fetch host.
+# -e hpc_bundle_force=true fetches and pushes anyway; so does
+# -e hpc_trivy_db_refresh=true (today's vulnerability DB, docs/trivy.md).
+- name: Manifest of the bundle this run wants
+  ansible.builtin.set_fact:
+    _hpc_manifest: "{{ lookup('ansible.builtin.template', 'MANIFEST.j2') }}"
   run_once: true
 
-- name: Push the bundle to the admin node
-  ansible.builtin.include_tasks: push.yml
+- name: Is this bundle already deployed
+  ansible.builtin.script:
+    cmd: deployed.sh
+  environment:
+    MANIFEST: "{{ _hpc_manifest }}"
+    DATA_ROOT: "{{ hpc_data_root }}"
+    OFFLINE_REPO: "{{ hpc_offline_repo }}"
+  become: true
+  delegate_to: "{{ hpc_admin_host }}"
   run_once: true
+  register: _deployed
+  changed_when: false
+  check_mode: false
+  when: not (hpc_bundle_force | bool or hpc_trivy_db_refresh | bool)
+
+- name: Bundle state
+  ansible.builtin.debug:
+    msg: "{{ ['bundle already deployed: fetch and push skipped (-e hpc_bundle_force=true to redo them)'] if _skip
+             else (_deployed.stdout_lines | default(['hpc_bundle_force / hpc_trivy_db_refresh: fetch and push']) | reject('equalto', 'deployed') | list) }}"
+  vars:
+    _skip: "{{ 'deployed' in (_deployed.stdout_lines | default([])) }}"
+  run_once: true
+
+- name: Fetch and push
+  when: "'deployed' not in (_deployed.stdout_lines | default([]))"
+  run_once: true
+  block:
+    - name: Fetch the bundle
+      ansible.builtin.include_tasks: fetch.yml
+      when: hpc_bundle_fetch | bool
+
+    - name: Push the bundle to the admin node
+      ansible.builtin.include_tasks: push.yml

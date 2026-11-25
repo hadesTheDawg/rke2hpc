@@ -11,6 +11,7 @@
     TENANT_DEFAULT_CPU_HOURS: "{{ hpc_tenant_default_cpu_hours }}"
   register: _ff
   changed_when: false
+  check_mode: false
   delegate_to: localhost
   become: false
 
@@ -97,6 +98,7 @@
 - name: Project certificate for the ingress
   ansible.builtin.shell:
     cmd: >-
+      set -o pipefail;
       {{ hpc_kubectl }} -n kube-system create secret tls hpc-apps-tls
       --cert=/etc/pki/hpc/apps.crt --key=/etc/pki/hpc/apps.key --dry-run=client -o yaml
       | {{ hpc_kubectl }} apply -f -

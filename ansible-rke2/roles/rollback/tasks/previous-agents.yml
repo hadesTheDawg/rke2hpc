@@ -1,0 +1,25 @@
+---
+# Compute nodes, after the server is back: the server's RKE2 version. Project
+# pods keep running while rke2-agent is stopped (refresh-agents.yml starts it).
+- name: "RKE2 {{ hostvars[hpc_admin_host]._rb_version }} on the compute nodes"
+  when: hostvars[hpc_admin_host]._rb_change | bool
+  vars:
+    _v: "{{ hostvars[hpc_admin_host]._rb_rpm_version }}"
+  block:
+    - name: Installed version
+      ansible.builtin.command: rpm -q --qf '%{VERSION}' rke2-agent
+      register: _rb_agent
+      changed_when: false
+      check_mode: false
+      failed_when: false
+    - name: Stop rke2-agent
+      ansible.builtin.systemd_service:
+        name: rke2-agent
+        state: stopped
+      when: _rb_agent.stdout != _v
+    - name: Install it
+      ansible.builtin.dnf:
+        name: ["rke2-agent-{{ _v }}", "rke2-common-{{ _v }}"]
+        state: present
+        allow_downgrade: true
+      when: _rb_agent.stdout != _v

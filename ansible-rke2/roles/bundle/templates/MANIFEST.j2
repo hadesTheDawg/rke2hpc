@@ -1,0 +1,39 @@
+{#
+  Offline bundle contents, written by the bundle role. When the admin node's
+  copy matches and the cluster runs, site.yml skips fetching and pushing the
+  bundle; the registry role skips publishing while its record matches
+  (docs/variables.md). Only the lines below are compared: comments in this
+  file are Jinja comments, so editing them never triggers a new download.
+#}
+arch={{ hpc_arch }}
+rke2={{ hpc_rke2_version }}
+rke2_cni={{ hpc_rke2_cni }}
+rancher={{ hpc_rancher_version }}
+keycloak={{ hpc_keycloak_version }}
+postgres={{ hpc_postgres_version }}
+registry={{ hpc_registry_version }}
+helm={{ hpc_helm_version }}
+kubelogin={{ hpc_kubelogin_version }}
+nfs_provisioner={{ hpc_nfs_provisioner_chart_version }}/{{ hpc_nfs_provisioner_image_tag }}
+ceph_csi={{ hpc_ceph_csi_chart_version }}
+offline_repo={{ hpc_offline_repo }}
+{% for t in _hpc_rke2_tarballs %}
+rke2_tarball={{ t }}
+{% endfor %}
+{% for c in hpc_charts %}
+chart={{ c | basename }}
+{% endfor %}
+{% if hpc_bundle_harvester | bool %}
+ui_plugin=harvester-{{ hpc_harvester_ui_version }}
+{% endif %}
+{% for i in _hpc_system_refs %}
+image.system={{ i }}
+{% endfor %}
+{% for i in hpc_images_user %}
+image.user={{ i }}
+{% endfor %}
+{% if hpc_offline_repo | bool %}
+{% for p in hpc_rpms + hpc_rpms_extra %}
+rpm={{ p }}
+{% endfor %}
+{% endif %}

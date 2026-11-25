@@ -1,2 +1,1 @@
-# PostgreSQL data: admin node's local disk, or hpc_persist_root when set
-hpc_keycloak_db_dir: "{{ (hpc_persist_root ~ '/keycloak-db') if hpc_persist_root else '/var/lib/hpc/keycloak-db' }}"
+# hpc_keycloak_db_dir (the PostgreSQL data) is in hpc_common: rollback uses it too.

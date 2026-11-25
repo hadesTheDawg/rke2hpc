@@ -7,4 +7,4 @@
   'system-default-registry': hpc_sysreg,
   'selinux': true,
   'node-label': ['hpc.io/role=compute'],
-} | combine(hpc_rke2_extra_agent_config)) | to_nice_yaml(indent=2) }}
+} | combine(_hpc_harvester_rke2) | combine(hpc_rke2_extra_agent_config)) | to_nice_yaml(indent=2) }}

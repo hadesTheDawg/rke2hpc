@@ -1,0 +1,90 @@
+---
+# Broker an upstream OpenID Connect provider in the Keycloak realm
+# (docs/upstream-idp.md). The upstream provider authenticates; the flat file
+# still decides who may log in: an upstream login is linked to the account of
+# the same name and refused when there is none.
+#
+# Where the provider's endpoints come from (the first one set wins):
+#   hpc_upstream_oidc_config_file    a saved openid-configuration (JSON or key: value) next to the inventory
+#   hpc_upstream_oidc_discovery_url  the URL of its .well-known/openid-configuration
+#   hpc_upstream_oidc_issuer         <issuer>/.well-known/openid-configuration
+#   hpc_upstream_oidc_spoof          lab: a second realm in this Keycloak plays the provider
+- name: Admin tools
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: admin-tools
+
+- name: Source of the provider's settings
+  ansible.builtin.set_fact:
+    _idp_source: >-
+      {{ 'file' if hpc_upstream_oidc_config_file | length > 0
+         else ('url' if (hpc_upstream_oidc_discovery_url | length > 0 or hpc_upstream_oidc_issuer | length > 0)
+         else 'spoof') }}
+    _idp_url: >-
+      {{ hpc_upstream_oidc_discovery_url if hpc_upstream_oidc_discovery_url | length > 0
+         else ((hpc_upstream_oidc_issuer | regex_replace('/+$', '')) ~ '/.well-known/openid-configuration'
+               if hpc_upstream_oidc_issuer | length > 0 else '') }}
+
+- name: A client id from the upstream provider
+  ansible.builtin.assert:
+    that: hpc_upstream_oidc_client_id | length > 0 or hpc_upstream_oidc_spoof | bool
+    fail_msg: >-
+      hpc_upstream_oidc_client_id is empty. Register this Keycloak as a client at the upstream
+      provider (redirect URI https://{{ hpc_keycloak_host }}/realms/{{ hpc_keycloak_realm }}/broker/{{ hpc_upstream_oidc_alias }}/endpoint),
+      then set the client id here and put its secret into {{ hpc_secrets_dir }}/upstream-oidc-client (docs/upstream-idp.md).
+
+# ---- a saved openid-configuration ---------------------------------------------------
+- name: Saved OpenID configuration
+  when: _idp_source == 'file'
+  block:
+    - name: Read and check it (on the deployer)
+      ansible.builtin.command:
+        argv: [python3, "{{ role_path }}/files/oidc_config.py", file, "{{ hpc_upstream_oidc_config_file }}"]
+      register: _idp_doc
+      changed_when: false
+      check_mode: false
+      delegate_to: localhost
+      become: false
+
+    - name: Issuer matches hpc_upstream_oidc_issuer
+      ansible.builtin.assert:
+        that: >-
+          hpc_upstream_oidc_issuer | length == 0 or
+          (_idp_doc.stdout | from_json).issuer | regex_replace('/+$', '') == hpc_upstream_oidc_issuer | regex_replace('/+$', '')
+        fail_msg: >-
+          {{ hpc_upstream_oidc_config_file }} is for issuer {{ (_idp_doc.stdout | from_json).issuer }},
+          but hpc_upstream_oidc_issuer is {{ hpc_upstream_oidc_issuer }}
+
+# ---- a discovery URL: Keycloak fetches it, so check it answers ------------------------
+- name: Discovery document answers (from the admin node)
+  ansible.builtin.uri:
+    url: "{{ _idp_url }}"
+    return_content: false
+    timeout: 15
+  register: _idp_reach
+  failed_when: false
+  check_mode: false
+  when: _idp_source == 'url'
+
+- name: Discovery document unreachable
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ _idp_url }} does not answer from the admin node ({{ _idp_reach.msg | default('') }}).
+      Keycloak has to reach it, and the provider's token and key endpoints at every login. If the
+      management network cannot reach the provider, save its openid-configuration as a file and set
+      hpc_upstream_oidc_config_file (docs/upstream-idp.md); the endpoints must still be reachable at login.
+  when: _idp_source == 'url' and (_idp_reach.status | default(0)) != 200
+
+- name: hpc-sync upstream
+  ansible.builtin.command: /usr/bin/python3 /usr/local/sbin/hpc-sync upstream
+  environment: "{{ hpc_sync_env | combine({
+      'UPSTREAM_OIDC_SECRET': hpc_upstream_oidc_secret,
+      'UPSTREAM_OIDC_CONFIG': (_idp_doc.stdout if _idp_source == 'file' else ''),
+      'UPSTREAM_OIDC_DISCOVERY_URL': (_idp_url if _idp_source == 'url' else '')}) }}"
+  register: _upsync
+  changed_when: "'added' in _upsync.stderr or 'updated' in _upsync.stderr or 'created' in _upsync.stderr"
+
+- name: hpc-sync output
+  ansible.builtin.debug:
+    msg: "{{ _upsync.stderr_lines }}"
+  when: _upsync.stderr | length > 0

@@ -50,7 +50,7 @@
     remote_src: true
     group: hpc-registry
     mode: "0640"
-  loop: [admin.crt, admin.key]
+  loop: [admin.crt, admin.key, local.crt, local.key]
   register: _tls
 
 # bcrypt salts differ on every run, so only rewrite when the password changed.
@@ -79,10 +79,10 @@
     group: hpc-registry
     mode: "0640"
   loop:
-    - {name: system-ro, addr: "{{ hpc_admin_ip }}:{{ hpc_registry_system_port }}", store: system, ro: true, auth: pull}
-    - {name: system-rw, addr: "127.0.0.1:{{ hpc_registry_system_rw_port }}", store: system, ro: false, auth: push}
-    - {name: user-ro, addr: "{{ hpc_admin_ip }}:{{ hpc_registry_user_port }}", store: user, ro: true, auth: ""}
-    - {name: user-rw, addr: "127.0.0.1:{{ hpc_registry_user_rw_port }}", store: user, ro: false, auth: push}
+    - {name: system-ro, addr: "{{ hpc_admin_ip }}:{{ hpc_registry_system_port }}", store: system, ro: true, auth: pull, cert: admin}
+    - {name: system-rw, addr: "127.0.0.1:{{ hpc_registry_system_rw_port }}", store: system, ro: false, auth: push, cert: local}
+    - {name: user-ro, addr: "{{ hpc_admin_ip }}:{{ hpc_registry_user_port }}", store: user, ro: true, auth: "", cert: admin}
+    - {name: user-rw, addr: "127.0.0.1:{{ hpc_registry_user_rw_port }}", store: user, ro: false, auth: push, cert: local}
   loop_control:
     label: "{{ item.name }}"
   register: _cfg
@@ -116,18 +116,32 @@
   retries: 30
   delay: 1
 
+# load-images.sh records the manifest of the bundle it published in
+# <data root>/registry/.hpc-published. When that is the bundle on the node,
+# every image is there and the (slow) check of each one is skipped.
+- name: Were this bundle's images published already
+  ansible.builtin.command:
+    argv: [cmp, -s, "{{ hpc_data_root }}/bundle/MANIFEST", "{{ hpc_data_root }}/registry/.hpc-published"]
+  register: _published
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
 - name: Publish the bundle's images
   ansible.builtin.script:
     cmd: load-images.sh
   environment:
     BUNDLE: "{{ hpc_data_root }}/bundle"
+    STAMP: "{{ hpc_data_root }}/registry/.hpc-published"
     PUSH_PASSWORD: "{{ hpc_registry_push_password }}"
     SYS: "localhost:{{ hpc_registry_system_rw_port }}"
     USR: "localhost:{{ hpc_registry_user_rw_port }}"
+    # tags whose content changes upstream: re-published when the digest differs
+    FLOATING: "aquasec/trivy-db:2 aquasec/trivy-java-db:1"
   register: _load
   changed_when: "'published 0 new' not in _load.stdout"
-  no_log: false
+  when: _published.rc != 0 or (hpc_bundle_force | default(false) | bool) or (hpc_trivy_db_refresh | bool)
 
 - name: Image load result
   ansible.builtin.debug:
-    msg: "{{ _load.stdout_lines | last }}"
+    msg: "{{ (_load.stdout_lines | last) if _load is not skipped else 'images of this bundle already published' }}"

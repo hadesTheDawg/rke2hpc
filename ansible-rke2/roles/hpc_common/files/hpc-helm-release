@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# hpc-helm-release <namespace> <release> <chart.tgz> <values.yaml> <timeout> [helm args...]
+# `helm upgrade --install --wait` only when something changed: the chart file,
+# the values file, or the release itself (another revision, or not deployed).
+# Prints "unchanged" or "deployed revision N". Runs as root on the admin node.
+set -euo pipefail
+ns="$1" rel="$2" chart="$3" values="$4" timeout="$5"; shift 5
+export KUBECONFIG=/etc/rancher/rke2/rke2.yaml
+helm=/usr/local/bin/helm
+state_dir=/var/lib/hpc/helm
+state="$state_dir/$ns.$rel"
+[ -s "$chart" ] || { echo "chart $chart not found" >&2; exit 1; }
+want=$(cat "$chart" "$values" | sha256sum | cut -d' ' -f1)
+
+current() { # "<status> <revision>" of the release, or nothing
+  "$helm" status "$rel" -n "$ns" -o json 2>/dev/null | jq -r '"\(.info.status) \(.version)"' || true
+}
+cur=$(current)
+if [ -f "$state" ] && [ "$cur" = "deployed $(awk '{print $2}' "$state")" ] && [ "$(awk '{print $1}' "$state")" = "$want" ]; then
+  echo unchanged
+  exit 0
+fi
+"$helm" upgrade --install "$rel" "$chart" --namespace "$ns" --wait --timeout "$timeout" -f "$values" "$@" >/dev/null
+cur=$(current)
+[ "${cur%% *}" = deployed ] || { echo "release $ns/$rel is '$cur' after the upgrade" >&2; exit 1; }
+mkdir -p "$state_dir"
+echo "$want ${cur#* }" >"$state.new" && mv -f "$state.new" "$state"
+echo "deployed revision ${cur#* }"

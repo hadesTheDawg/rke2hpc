@@ -28,9 +28,22 @@
     src: "{{ item }}"
     dest: /usr/local/libexec/hpc/verify/
     mode: "0755"
-  loop: [lib.sh, infra.sh, tenants.sh, accounting.sh, rancher-oidc-login.py]
+  loop: [lib.sh, infra.sh, tenants.sh, accounting.sh, components.sh, rancher-oidc-login.py, upstream-login.py]
+
+# The issuer the upstream identity provider must have (docs/upstream-idp.md).
+- name: Upstream issuer from the saved configuration
+  ansible.builtin.command:
+    argv: [python3, "{{ role_path }}/../upstream_idp/files/oidc_config.py", file, "{{ hpc_upstream_oidc_config_file }}"]
+  register: _up_doc
+  changed_when: false
+  check_mode: false
+  delegate_to: localhost
+  become: false
+  when: hpc_enable_upstream_idp | bool and hpc_upstream_oidc_config_file | length > 0
 
 - name: Check environment
+  vars:
+    _local_rpms: "{{ lookup('ansible.builtin.fileglob', hpc_local_rpms_dir ~ '/*.rpm', wantlist=True) }}"
   ansible.builtin.set_fact:
     _verify_env:
       VERIFY_DIR: /usr/local/libexec/hpc/verify
@@ -47,6 +60,7 @@
       REGISTRY_USER_HOST: "{{ hpc_registry_user_host }}"
       REGISTRY_USER_PORT: "{{ hpc_registry_user_port }}"
       REGISTRY_USER_RW_PORT: "{{ hpc_registry_user_rw_port }}"
+      REPO_PORT: "{{ hpc_repo_port if (hpc_offline_repo | bool or _local_rpms | length > 0) else '' }}"
       PULL_PASSWORD: "{{ hpc_registry_pull_password }}"
       STORAGE_CLASS: "{{ hpc_storage_class }}"
       KEYCLOAK_HOST: "{{ hpc_keycloak_host }}"
@@ -66,6 +80,22 @@
       HOME_VOLUME: "{{ hpc_home_volume }}"
       HOME_CREATE_ROOT: "{{ hpc_home_create_root }}"
       BACKUP_DIR: "{{ hpc_backup_dir if hpc_enable_backup | bool else '' }}"
+      DATA_ROOT: "{{ hpc_data_root }}"
+      CHARTS_URL: "{{ hpc_charts_url if hpc_enable_charts_repo | bool else '' }}"
+      CHARTS_REPO: "{{ hpc_charts_rancher_repo }}"
+      TRIVY_ENABLED: "{{ hpc_enable_trivy | string | lower }}"
+      TRIVY_NS: "{{ hpc_trivy_namespace }}"
+      HARVESTER_UI: "{{ (hpc_enable_harvester | bool and hpc_harvester_ui | bool) | string | lower }}"
+      HARVESTER_UI_URL: "{{ hpc_harvester_ui_url }}"
+      HARVESTER_UI_VERSION: "{{ hpc_harvester_ui_version }}"
+      UPSTREAM_ALIAS: "{{ hpc_upstream_oidc_alias if hpc_enable_upstream_idp | bool else '' }}"
+      UPSTREAM_SPOOF: "{{ hpc_upstream_oidc_spoof | string | lower }}"
+      UPSTREAM_ISSUER: >-
+        {{ (_up_doc.stdout | from_json).issuer if _up_doc.stdout is defined
+           else (hpc_upstream_oidc_issuer if hpc_upstream_oidc_issuer | length > 0
+           else (('https://' ~ hpc_keycloak_host ~ '/realms/' ~ hpc_keycloak_realm ~ '-upstream-sim')
+                 if (hpc_upstream_oidc_spoof | bool and hpc_upstream_oidc_discovery_url | length == 0) else '')) }}
+      KC_ADMIN_PW: "{{ hpc_keycloak_admin_password }}"
       USER_A: "{{ _a.users[0] }}"
       GROUP_A: "{{ _a.group }}"
       PW_A: "{{ lookup('ansible.builtin.password', hpc_secrets_dir ~ '/users/' ~ _a.users[0], length=20, chars=hpc_secret_chars) }}"
@@ -85,7 +115,7 @@
     cmd: ". /usr/local/libexec/hpc/verify/lib.sh; . /usr/local/libexec/hpc/verify/{{ item }}.sh"
     executable: /bin/bash
   environment: "{{ _verify_env }}"
-  loop: "{{ ['infra', 'tenants'] + (['accounting'] if hpc_enable_accounting else []) }}"
+  loop: "{{ ['infra', 'tenants'] + (['accounting'] if hpc_enable_accounting else []) + ['components'] }}"
   register: _checks
   changed_when: false
   failed_when: false

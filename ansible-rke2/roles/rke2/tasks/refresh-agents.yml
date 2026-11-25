@@ -1,0 +1,52 @@
+---
+# After an etcd restore the cluster's data is older than what long-running
+# watchers on the compute nodes last saw, and they miss every change until the
+# store catches up with their old position. In the lab that broke pod network
+# policy (Calico) and Service name lookups (a CoreDNS replica on a compute node).
+# Restart every platform watcher there once; project pods keep running.
+# Used by main.yml (after a restore) and by rollback.yml.
+#
+# Only compute nodes that have rke2-agent installed and enabled are refreshed
+# (a stopped one, as in rollback.yml previous, is started). Nodes without it
+# (re-provisioned or uninstalled together with the admin node) join in the
+# agents' play with fresh watchers anyway.
+- name: Restart rke2-agent and kube-proxy on the compute nodes
+  ansible.builtin.shell:
+    cmd: |
+      [ -x /usr/bin/rke2 ] && systemctl is-enabled --quiet rke2-agent 2>/dev/null || { echo "no rke2-agent: joins later"; exit 0; }
+      systemctl restart rke2-agent
+      c="/var/lib/rancher/rke2/bin/crictl --config /var/lib/rancher/rke2/agent/etc/crictl.yaml"
+      ids=$($c ps --name kube-proxy -q 2>/dev/null)
+      [ -z "$ids" ] || $c stop $ids >/dev/null
+      echo restarted
+  delegate_to: "{{ item }}"
+  loop: "{{ hpc_compute_hosts }}"
+  register: _refresh_agents
+  changed_when: "'restarted' in _refresh_agents.stdout"
+
+# CNI, CSI node plugins, and Deployment replicas that landed on compute nodes
+# (CoreDNS: in the lab it kept serving Services from before the restore).
+# The admin node's pods are new anyway.
+- name: Recreate the platform pods on the compute nodes
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      k="{{ hpc_kubectl }}"
+      nodes="{{ _refreshed | join(' ') }}"
+      [ -n "$nodes" ] || { echo "no running compute node to refresh"; exit 0; }
+      platform() { $k get ns -l 'hpc.io/tenant!=true' -o jsonpath='{.items[*].metadata.name}'; }
+      for n in $nodes; do for ns in $(platform); do
+        $k -n "$ns" delete pod --field-selector "spec.nodeName=$n" --wait=false
+      done; done
+      for i in $(seq 120); do
+        bad=$(for n in $nodes; do for ns in $(platform); do
+                $k -n "$ns" get pods --no-headers --field-selector "spec.nodeName=$n" 2>/dev/null \
+                  | grep -v -E ' (Running|Completed) ' || true; done; done)
+        [ -z "$bad" ] && { echo "recreated on $nodes"; exit 0; }
+        sleep 5
+      done
+      echo "not ready after 10 minutes:"; echo "$bad"; exit 1
+  vars:
+    _refreshed: "{{ _refresh_agents.results | selectattr('stdout', 'search', 'restarted') | map(attribute='item') | list }}"
+  register: _recreate
+  changed_when: "'recreated' in _recreate.stdout"

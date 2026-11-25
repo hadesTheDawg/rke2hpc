@@ -18,8 +18,7 @@
   environment: "{{ hpc_sync_env | combine({
       'HPC_PASSWORDS': hpc_user_passwords,
       'RANCHER_OIDC_SECRET': hpc_rancher_oidc_secret,
-      'RANCHER_ADMIN_PASSWORD': hpc_rancher_admin_password,
-      'UPSTREAM_OIDC_SECRET': (hpc_upstream_oidc_secret if (hpc_upstream_oidc_spoof or hpc_upstream_oidc_issuer) else '')}) }}"
+      'RANCHER_ADMIN_PASSWORD': hpc_rancher_admin_password}) }}"
   register: _sync
   changed_when: "'created' in _sync.stderr or 'updated' in _sync.stderr or 'configured' in _sync.stderr"
 

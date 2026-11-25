@@ -35,4 +35,4 @@ cp -f "/etc/pki/rpm-gpg/RPM-GPG-KEY-Rocky-$EL_MAJOR" "$W/repo/RPM-GPG-KEY-distro
   || cp -f "$(ls /etc/pki/rpm-gpg/RPM-GPG-KEY-* | head -1)" "$W/repo/RPM-GPG-KEY-distro"
 createrepo_c -q --update "$W/repo"
 chmod -R a+rX "$W"
-echo "repo: $(ls "$W/repo" | grep -c '\.rpm$') rpms, $(du -sh "$W/repo" | awk '{print $1}')"
+echo "repo: $(find "$W/repo" -maxdepth 1 -name '*.rpm' | wc -l | tr -d ' ') rpms, $(du -sh "$W/repo" | awk '{print $1}')"

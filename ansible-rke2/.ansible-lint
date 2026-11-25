@@ -1,0 +1,21 @@
+# ansible-lint settings for check.sh. The deployment uses only ansible.builtin
+# (no collections), names tasks in plain language and drives kubectl/helm
+# through command/shell on purpose.
+profile: basic
+exclude_paths:
+  - .bundle/
+  - .logs/
+  - inventories/
+skip_list:
+  - var-naming[no-role-prefix]   # shared settings are hpc_*, internal ones _*, by design
+  - name[casing]                 # task names start with the object ("kubectl and helm for root")
+  - name[template]
+  - command-instead-of-module    # rpm -q / systemctl is-active probes are deliberate
+  - command-instead-of-shell
+  - no-changed-when              # reviewed: probes set changed_when: false
+  - risky-shell-pipe             # pipelines set pipefail where a failure could hide
+  - run-once[task]
+  - no-handler
+warn_list:
+  - yaml[line-length]
+  - jinja[spacing]

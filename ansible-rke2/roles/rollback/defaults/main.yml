@@ -1,0 +1,24 @@
+# rollback.yml settings (docs/rollback.md). Give them with -e.
+hpc_rollback_mode: ""              # list | previous | uninstall
+hpc_rollback_confirm: ""           # previous/uninstall: must be hpc_cluster_name
+hpc_rollback_list_max: 15          # list: snapshots shown
+
+# ---- previous -------------------------------------------------------------------
+# etcd snapshot to go back to: a file name from `-e hpc_rollback_mode=list`, or a
+# path on the admin node. Default: the snapshot taken before the last version
+# change (hpc_rke2_upgrade), as recorded in /var/lib/hpc/rollback/state.json.
+hpc_rollback_snapshot: ""
+# RKE2 version to run after the restore (e.g. v1.36.6+rke2r1). Default: the
+# version recorded with that snapshot; for any other snapshot the installed one.
+hpc_rollback_rke2_version: ""
+
+# ---- uninstall ------------------------------------------------------------------
+# Save an etcd snapshot before the server is removed: into hpc_backup_dir/etcd
+# (named hpc-pre-uninstall-*, never restored automatically), or, without a
+# backup directory, into <secrets>/snapshots on the deployer.
+hpc_rollback_final_snapshot: true
+# Also delete what site.yml can rebuild: hpc_data_root (bundle copy, registry
+# storage, repository), /var/lib/hpc, and the Keycloak database when it is on
+# the admin node's local disk. Never deleted: hpc_persist_root, NFS exports
+# (homes, volumes), the backup directory, and the deployer's secrets.
+hpc_rollback_purge_data: false

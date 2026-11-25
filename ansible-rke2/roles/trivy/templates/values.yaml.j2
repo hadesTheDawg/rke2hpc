@@ -1,0 +1,46 @@
+# managed by ansible (hpc trivy). Chart: trivy-operator {{ hpc_trivy_operator_chart_version }}
+{# same mirrors as the nodes' registries.yaml: scanners pull images themselves #}
+{% set _registries = {
+     'index.docker.io': [hpc_usrreg, hpc_sysreg],
+     'quay.io': [hpc_sysreg],
+     'ghcr.io': [hpc_sysreg],
+     'registry.k8s.io': [hpc_sysreg],
+     'mirror.gcr.io': [hpc_sysreg]} %}
+{{ ({
+  'global': {'image': {'registry': hpc_sysreg}},
+  'targetNamespaces': hpc_trivy_target_namespaces,
+  'excludeNamespaces': hpc_trivy_exclude_namespaces,
+  'operator': {
+    'scanJobsConcurrentLimit': hpc_trivy_concurrent_scans | int,
+    'scannerReportTTL': hpc_trivy_report_ttl,
+    'vulnerabilityScannerEnabled': true,
+    'configAuditScannerEnabled': true,
+    'rbacAssessmentScannerEnabled': true,
+    'exposedSecretScannerEnabled': true,
+    'clusterComplianceEnabled': true,
+    'sbomGenerationEnabled': true,
+    'infraAssessmentScannerEnabled': false,
+  },
+  'trivyOperator': {
+    'scanJobCustomVolumes': [{'name': 'hpc-ca', 'configMap': {'name': 'hpc-ca'}}],
+    'scanJobCustomVolumesMount': [{'name': 'hpc-ca', 'mountPath': '/etc/hpc-ca', 'readOnly': true}],
+  },
+  'trivy': {
+    'mode': 'Standalone',
+    'command': 'image',
+    'severity': hpc_trivy_severity,
+    'sslCertDir': '/etc/hpc-ca',
+    'dbRegistry': hpc_sysreg,
+    'dbRepository': 'aquasec/trivy-db',
+    'javaDbRegistry': hpc_sysreg,
+    'javaDbRepository': 'aquasec/trivy-java-db',
+    'dbRepositoryUsername': 'pull',
+    'dbRepositoryPassword': hpc_registry_pull_password,
+    'skipJavaDBUpdate': not (hpc_trivy_java_db | bool),
+    'offlineScan': true,
+    'useBuiltinRegoPolicies': 'false',
+    'useEmbeddedRegoPolicies': 'true',
+    'resources': {'requests': {'cpu': '100m', 'memory': '256M'}, 'limits': {'cpu': '1', 'memory': '2Gi'}},
+    'configFile': {'registry': {'mirrors': _registries, 'username': ['pull'], 'password': [hpc_registry_pull_password]}},
+  },
+} | combine(hpc_trivy_extra_values, recursive=true)) | to_nice_yaml(indent=2) }}

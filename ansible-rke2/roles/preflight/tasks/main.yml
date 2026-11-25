@@ -39,6 +39,32 @@
     hpc_mgmt_ip: "{{ hpc_mgmt_ip }}"
     hpc_pod_ip: "{{ hpc_pod_ip }}"
 
+# With --limit, the nodes left out still appear in /etc/hosts, the firewall
+# lists and the cluster checks: read their facts and addresses too.
+- name: Facts of cluster nodes outside --limit
+  ansible.builtin.setup:
+    gather_subset: [min, network]
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ hpc_cluster_hosts | difference(ansible_play_hosts_all) }}"
+  run_once: true
+  check_mode: false
+
+- name: Their addresses
+  ansible.builtin.set_fact:
+    hpc_mgmt_ip: >-
+      {{ hostvars[item].hpc_mgmt_ip | default(_f[_mi | replace('-', '_')]['ipv4']['address'], true) }}
+    hpc_pod_ip: >-
+      {{ hostvars[item].hpc_pod_ip | default(_f[(_pi or _mi) | replace('-', '_')]['ipv4']['address'], true) }}
+  vars:
+    _f: "{{ hostvars[item].ansible_facts }}"
+    _mi: "{{ hostvars[item].hpc_mgmt_iface | default(hpc_mgmt_iface) }}"
+    _pi: "{{ hostvars[item].hpc_pod_iface | default(hpc_pod_iface) }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ hpc_cluster_hosts | difference(ansible_play_hosts_all) }}"
+  run_once: true
+
 - name: Networks
   ansible.builtin.debug:
     msg: "{{ inventory_hostname }}: management {{ hpc_mgmt_iface }} {{ hpc_mgmt_ip }}, pods {{ hpc_pod_iface or hpc_mgmt_iface }} {{ hpc_pod_ip }}"
@@ -61,6 +87,7 @@
   delegate_to: localhost
   run_once: true
   changed_when: false
+  check_mode: false
 
 # Persistent storage for the admin node's state (docs/reprovisioning.md). If the
 # mount is missing, writing there would silently land on the local disk that a
@@ -73,6 +100,7 @@
       findmnt -n -o TARGET,FSTYPE -T "$p"
   register: _persist_mnt
   changed_when: false
+  check_mode: false
   failed_when: >-
     _persist_mnt.rc != 0 or
     ((hpc_persist_require_mount | bool) and _persist_mnt.stdout.split()[0] == '/')

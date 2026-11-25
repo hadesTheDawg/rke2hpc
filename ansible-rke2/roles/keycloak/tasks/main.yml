@@ -1,6 +1,11 @@
 ---
 # Keycloak (production mode, behind the ingress) with a dedicated PostgreSQL on
 # the admin node's local disk.
+- name: Admin tools
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: admin-tools
+
 - name: Database directory
   ansible.builtin.file:
     path: "{{ hpc_keycloak_db_dir }}"
@@ -48,6 +53,12 @@
   ansible.builtin.command: "{{ hpc_kubectl }} -n keycloak rollout status {{ item }} --timeout=600s"
   loop: [statefulset/keycloak-db, deployment/keycloak]
   changed_when: false
+
+# Keycloak's truststore (configmap hpc-ca) is read only at start.
+- name: Restart Keycloak if the trusted CAs changed since it started
+  ansible.builtin.command: /usr/local/libexec/hpc/hpc-restart-if-stale keycloak keycloak /etc/pki/hpc/ca.crt
+  register: _kstale
+  changed_when: "'restarted' in _kstale.stdout"
 
 - name: Keycloak answers through the ingress
   ansible.builtin.uri:

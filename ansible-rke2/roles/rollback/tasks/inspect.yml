@@ -1,0 +1,29 @@
+---
+# Admin node: what can be rolled back to. Sets _rb_state (the record of the last
+# version change), _rb_snaps (every etcd snapshot, newest first) and
+# _rb_installed (RKE2 version on this node).
+- name: Record of the last version change
+  ansible.builtin.slurp:
+    src: /var/lib/hpc/rollback/state.json
+  register: _rb_state_raw
+  failed_when: false
+
+- name: etcd snapshots (local and in the backup directory)
+  ansible.builtin.find:
+    paths: "{{ ['/var/lib/rancher/rke2/server/db/snapshots'] + ([hpc_backup_dir ~ '/etcd'] if hpc_backup_dir else []) }}"
+    file_type: file
+    patterns: ["hpc-*", "etcd-snapshot-*", "on-demand-*"]
+  register: _rb_found
+
+- name: Installed RKE2
+  ansible.builtin.command: rpm -q --qf '%{VERSION}' rke2-server
+  register: _rb_rpm
+  changed_when: false
+  check_mode: false
+  failed_when: false
+
+- name: What there is
+  ansible.builtin.set_fact:
+    _rb_state: "{{ (_rb_state_raw.content | b64decode | from_json) if _rb_state_raw.content is defined else {} }}"
+    _rb_snaps: "{{ _rb_found.files | sort(attribute='mtime', reverse=true) }}"
+    _rb_installed: "{{ ('v' ~ (_rb_rpm.stdout | replace('~', '+'))) if _rb_rpm.rc == 0 else '' }}"

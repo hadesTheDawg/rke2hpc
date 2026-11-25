@@ -1,0 +1,42 @@
+---
+# -e hpc_rollback_mode=list: show the restore points; changes nothing.
+- name: Restore points
+  ansible.builtin.include_tasks: inspect.yml
+
+- name: RKE2 versions in the package repository
+  ansible.builtin.shell:
+    cmd: dnf -q list --showduplicates rke2-server 2>/dev/null | awk '$1 ~ /^rke2-server/ {print $2}' | sort -uV
+  register: _rb_avail
+  changed_when: false
+  check_mode: false
+
+# one line per snapshot, newest first: name, time, where it is (local = RKE2's
+# snapshot directory, backup = hpc_backup_dir/etcd)
+- name: Snapshot listing
+  ansible.builtin.shell:
+    cmd: >-
+      find {{ (['/var/lib/rancher/rke2/server/db/snapshots'] + ([hpc_backup_dir ~ '/etcd'] if hpc_backup_dir else [])) | map('quote') | join(' ') }}
+      -maxdepth 1 -type f \( -name 'hpc-*' -o -name 'etcd-snapshot-*' -o -name 'on-demand-*' \)
+      -printf '%T@ %f %TY-%Tm-%Td_%TH:%TM %h\n' 2>/dev/null | sort -rn
+      | awk -v n={{ hpc_rollback_list_max | default(15) }} -v local=/var/lib/rancher/rke2/server/db/snapshots '
+        { w = ($4 == local) ? "local" : "backup"
+          if (!($2 in at)) { order[++k] = $2; when[$2] = $3; at[$2] = w } else if (index(at[$2], w) == 0) at[$2] = at[$2] "+" w }
+        END { for (i = 1; i <= k && i <= n; i++) { s = order[i]; d = when[s]; sub("_", " ", d); printf "%-34s %s  %s\n", s, d, at[s] }
+              if (k > n) printf "... and %d older (-e hpc_rollback_list_max=%d shows all)\n", k - n, k }'
+  register: _rb_listing
+  changed_when: false
+  check_mode: false
+
+- name: Rollback information
+  ansible.builtin.debug:
+    msg:
+      - "installed: RKE2 {{ _rb_installed or 'none' }}; hpc_rke2_version {{ hpc_rke2_version }}"
+      - "in the repository: {{ _rb_avail.stdout_lines | map('regex_replace', '^(.*)-[^-]*$', '\\1') | join(', ') }}"
+      - "{{ ('last version change ' ~ _rb_state.time ~ ': RKE2 ' ~ _rb_state.rke2_from ~ ' -> ' ~ _rb_state.rke2_to
+             ~ ((', Rancher was ' ~ _rb_state.rancher_from) if _rb_state.rancher_from | default('') else '')
+             ~ ', snapshot ' ~ (_rb_state.snapshot | basename)
+             ~ ((', rolled back ' ~ _rb_state.rolled_back) if _rb_state.rolled_back is defined else ''))
+            if _rb_state.time is defined else 'no version change recorded (hpc_rke2_upgrade was never used)' }}"
+      - "snapshots, newest first:"
+      - "{{ _rb_listing.stdout_lines }}"
+      - "go back: rollback.yml -e hpc_rollback_mode=previous [-e hpc_rollback_snapshot=<name>] -e hpc_rollback_confirm={{ hpc_cluster_name }}"

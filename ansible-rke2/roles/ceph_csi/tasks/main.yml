@@ -7,6 +7,7 @@
   register: _mod
   changed_when: false
   failed_when: false
+  check_mode: false
   delegate_to: "{{ item }}"
   loop: "{{ hpc_cluster_hosts }}"
   become: true
@@ -28,7 +29,7 @@
 
 - name: Namespace
   ansible.builtin.shell:
-    cmd: "{{ hpc_kubectl }} create namespace {{ hpc_ceph_namespace }} --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -"
+    cmd: "set -o pipefail; {{ hpc_kubectl }} create namespace {{ hpc_ceph_namespace }} --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -"
   register: _ns
   changed_when: "'created' in _ns.stdout"
 
@@ -45,13 +46,16 @@
     mode: "0600"
 
 - name: ceph-csi-cephfs
-  ansible.builtin.command: >-
-    {{ hpc_helm }} upgrade --install ceph-csi-cephfs
-    {{ hpc_data_root }}/bundle/charts/ceph-csi-cephfs-{{ hpc_ceph_csi_chart_version }}.tgz
-    --namespace {{ hpc_ceph_namespace }} --wait --timeout 10m -f /etc/hpc/ceph-csi-cephfs-values.yaml
-  environment:
-    KUBECONFIG: /etc/rancher/rke2/rke2.yaml
-  changed_when: true
+  ansible.builtin.command:
+    argv:
+      - /usr/local/libexec/hpc/hpc-helm-release
+      - "{{ hpc_ceph_namespace }}"
+      - ceph-csi-cephfs
+      - "{{ hpc_data_root }}/bundle/charts/ceph-csi-cephfs-{{ hpc_ceph_csi_chart_version }}.tgz"
+      - /etc/hpc/ceph-csi-cephfs-values.yaml
+      - 10m
+  register: _cephrel
+  changed_when: "'deployed' in _cephrel.stdout"
 
 - name: Without Ceph connection details only the driver is installed
   ansible.builtin.debug:

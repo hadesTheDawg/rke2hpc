@@ -82,6 +82,7 @@
   ansible.builtin.command: journalctl -u hpc-backup.service -n 3 -o cat --no-pager
   register: _bk
   changed_when: false
+  check_mode: false
 
 - name: Last backup
   ansible.builtin.debug:

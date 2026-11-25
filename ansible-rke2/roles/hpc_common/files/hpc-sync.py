@@ -84,7 +84,10 @@ def kapply(objs):
 # --------------------------------------------------------------------------- http
 class Http:
     def __init__(self):
-        self.ctx = ssl.create_default_context(cafile=CA_FILE)
+        # The site CA bundle plus the system store: an upstream identity
+        # provider may have a certificate from a public CA.
+        self.ctx = ssl.create_default_context()
+        self.ctx.load_verify_locations(cafile=CA_FILE)
 
     def call(self, method, url, body=None, headers=None, form=None, ok=(200, 201, 204)):
         hdrs = dict(headers or {})
@@ -311,8 +314,6 @@ def cmd_identity(inp):
         uid = kc.ensure_user(REALM, name, inp["passwords"][name], truthy("INITIAL_PASSWORDS_TEMPORARY"))
         kc.set_memberships(REALM, uid, {admin_gid}, {admin_gid})
 
-    configure_upstream(kc, inp)
-
     # Kubernetes: the admin group is cluster-admin when it comes in over OIDC.
     kapply([{
         "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding",
@@ -327,11 +328,52 @@ def cmd_identity(inp):
         log("Rancher is not installed; skipping its login configuration")
 
 
+def oidc_doc_to_keycloak(doc):
+    """Keycloak identity-provider settings from an OpenID provider metadata
+    document (.well-known/openid-configuration); what Keycloak's own
+    import-config does, done here so a saved document works without Keycloak
+    fetching anything at configuration time."""
+    missing = [k for k in ("issuer", "authorization_endpoint", "token_endpoint", "jwks_uri") if not doc.get(k)]
+    if missing:
+        die("upstream OpenID configuration lacks %s" % ", ".join(missing))
+    conf = {"issuer": doc["issuer"], "authorizationUrl": doc["authorization_endpoint"],
+            "tokenUrl": doc["token_endpoint"], "jwksUrl": doc["jwks_uri"],
+            "useJwksUrl": "true", "validateSignature": "true"}
+    if doc.get("userinfo_endpoint"):
+        conf["userInfoUrl"] = doc["userinfo_endpoint"]
+    if doc.get("end_session_endpoint"):
+        conf["logoutUrl"] = doc["end_session_endpoint"]
+    return conf
+
+
+def upstream_settings(doc, conf):
+    """Client authentication and PKCE: what the provider says it supports,
+    unless the site set it."""
+    auth = E.get("UPSTREAM_OIDC_CLIENT_AUTH", "")
+    methods = doc.get("token_endpoint_auth_methods_supported") or ["client_secret_basic"]
+    if not auth:
+        auth = "client_secret_post" if "client_secret_post" in methods else "client_secret_basic"
+    pkce = "S256" in (doc.get("code_challenge_methods_supported") or [])
+    conf.update({"clientAuthMethod": auth, "pkceEnabled": str(pkce).lower()})
+    if pkce:
+        conf["pkceMethod"] = "S256"
+    return conf
+
+
 def configure_upstream(kc, inp):
     """Optional: broker an upstream OIDC provider. Upstream authenticates, the flat
-    file authorises: a login only succeeds when the upstream preferred_username
-    matches an account this deployment created."""
+    file authorises: a login only succeeds when the upstream username claim
+    matches an account this deployment created.
+
+    Where the provider's settings come from (first one set wins):
+      UPSTREAM_OIDC_CONFIG          a saved openid-configuration document (JSON,
+                                    normalised on the deployer by the upstream_idp role)
+      UPSTREAM_OIDC_DISCOVERY_URL   the document's URL (Keycloak fetches it)
+      UPSTREAM_OIDC_ISSUER          <issuer>/.well-known/openid-configuration
+    """
     issuer = E.get("UPSTREAM_OIDC_ISSUER", "")
+    discovery = E.get("UPSTREAM_OIDC_DISCOVERY_URL", "")
+    saved = E.get("UPSTREAM_OIDC_CONFIG", "")
     client_id = E.get("UPSTREAM_OIDC_CLIENT_ID", "")
     secret = inp.get("upstream_oidc_secret", "")
     alias = E.get("UPSTREAM_OIDC_ALIAS", "upstream")
@@ -339,19 +381,36 @@ def configure_upstream(kc, inp):
         # A second realm in this Keycloak plays the upstream provider.
         sim = REALM + "-upstream-sim"
         kc.ensure_realm(sim, "Simulated upstream IdP")
-        client_id, issuer = "hpc-keycloak", "%s/realms/%s" % (KC_URL, sim)
+        client_id = "hpc-keycloak"
+        issuer = "%s/realms/%s" % (KC_URL, sim)
         kc.ensure_client(sim, {
             "clientId": client_id, "enabled": True, "protocol": "openid-connect", "publicClient": False,
             "secret": secret, "standardFlowEnabled": True, "directAccessGrantsEnabled": False,
             "redirectUris": ["%s/realms/%s/broker/%s/endpoint" % (KC_URL, REALM, alias)],
         }, [])
-    if not issuer:
+    if not (saved or discovery or issuer):
         return
+    if not client_id:
+        die("an upstream identity provider needs hpc_upstream_oidc_client_id")
     base = "/%s/identity-provider" % REALM
-    conf = kc.call("POST", base + "/import-config",
-                   {"providerId": "oidc", "fromUrl": issuer + "/.well-known/openid-configuration"})[1]
-    conf.update({"clientId": client_id, "clientSecret": secret, "clientAuthMethod": "client_secret_post",
-                 "defaultScope": "openid profile email", "syncMode": "IMPORT", "useJwksUrl": "true"})
+    if saved:
+        doc = json.loads(saved)
+        conf = oidc_doc_to_keycloak(doc)
+        source = "saved configuration (issuer %s)" % doc["issuer"]
+    else:
+        url = discovery or issuer.rstrip("/") + "/.well-known/openid-configuration"
+        status, doc, _ = HTTP.call("GET", url, ok=None)
+        if status != 200 or not isinstance(doc, dict):
+            log("upstream: %s not readable from the admin node (HTTP %s); Keycloak fetches it itself" % (url, status))
+            doc = {}
+        conf = kc.call("POST", base + "/import-config", {"providerId": "oidc", "fromUrl": url})[1]
+        source = url
+    if issuer and conf.get("issuer") and conf["issuer"].rstrip("/") != issuer.rstrip("/"):
+        die("upstream issuer is %s, but hpc_upstream_oidc_issuer says %s" % (conf["issuer"], issuer))
+    conf = upstream_settings(doc, conf)
+    conf.update({"clientId": client_id, "clientSecret": secret,
+                 "defaultScope": E.get("UPSTREAM_OIDC_SCOPES", "openid profile email"),
+                 "syncMode": "IMPORT", "useJwksUrl": "true"})
 
     # First login through the broker: attach to the pre-created account with the
     # same username; never create accounts on the fly.
@@ -368,15 +427,23 @@ def configure_upstream(kc, inp):
             kc.call("PUT", fpath, dict(ex, requirement="REQUIRED"))
         log("keycloak: created authentication flow '%s'" % flow)
 
-    rep = {"alias": alias, "displayName": "Site login", "providerId": "oidc", "enabled": True, "trustEmail": True,
-           "storeToken": False, "linkOnly": False, "firstBrokerLoginFlowAlias": flow, "config": conf}
-    if kc.call("GET", "%s/instances/%s" % (base, alias), ok=(200, 404))[0] == 404:
+    rep = {"alias": alias, "displayName": E.get("UPSTREAM_OIDC_DISPLAY_NAME", "Site login"), "providerId": "oidc",
+           "enabled": True, "trustEmail": True, "storeToken": False, "linkOnly": False,
+           "firstBrokerLoginFlowAlias": flow, "config": conf}
+    status, cur, _ = kc.call("GET", "%s/instances/%s" % (base, alias), ok=(200, 404))
+    if status == 404:
         kc.call("POST", base + "/instances", rep)
-        log("keycloak: added identity provider '%s' -> %s" % (alias, issuer))
+        log("keycloak: added identity provider '%s' from %s" % (alias, source))
     else:
-        kc.call("PUT", "%s/instances/%s" % (base, alias), rep)
+        # Keycloak masks the stored secret; compare everything else.
+        keep = dict(cur.get("config") or {}, clientSecret=secret)
+        if any(cur.get(k) != rep[k] for k in ("displayName", "enabled", "firstBrokerLoginFlowAlias")) \
+                or any(keep.get(k) != v for k, v in conf.items()):
+            log("keycloak: updated identity provider '%s' from %s" % (alias, source))
+        kc.call("PUT", "%s/instances/%s" % (base, alias), dict(cur, **rep))
+    claim = E.get("UPSTREAM_OIDC_USERNAME_CLAIM", "preferred_username")
     mapper = {"name": "username", "identityProviderAlias": alias, "identityProviderMapper": "oidc-username-idp-mapper",
-              "config": {"syncMode": "INHERIT", "template": "${CLAIM.preferred_username}", "target": "LOCAL"}}
+              "config": {"syncMode": "INHERIT", "template": "${CLAIM.%s}" % claim, "target": "LOCAL"}}
     have = {m["name"]: m for m in kc.get("%s/instances/%s/mappers" % (base, alias))}
     if "username" in have:
         kc.call("PUT", "%s/instances/%s/mappers/%s" % (base, alias, have["username"]["id"]),
@@ -892,16 +959,20 @@ def cmd_tenants(inp):
     })
 
 
+def cmd_upstream(inp):
+    configure_upstream(Keycloak(), inp)
+
+
 def main():
-    if len(sys.argv) != 2 or sys.argv[1] not in ("identity", "tenants"):
-        die("usage: hpc-sync identity|tenants")
+    if len(sys.argv) != 2 or sys.argv[1] not in ("identity", "tenants", "upstream"):
+        die("usage: hpc-sync identity|tenants|upstream")
     inp = {
         "passwords": dict(kv.split(":", 1) for kv in E.get("HPC_PASSWORDS", "").split()),
         "rancher_oidc_secret": E.get("RANCHER_OIDC_SECRET", ""),
         "rancher_admin_password": E.get("RANCHER_ADMIN_PASSWORD", ""),
         "upstream_oidc_secret": E.get("UPSTREAM_OIDC_SECRET", ""),
     }
-    {"identity": cmd_identity, "tenants": cmd_tenants}[sys.argv[1]](inp)
+    {"identity": cmd_identity, "tenants": cmd_tenants, "upstream": cmd_upstream}[sys.argv[1]](inp)
 
 
 if __name__ == "__main__":

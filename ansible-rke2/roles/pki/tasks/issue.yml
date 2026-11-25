@@ -1,6 +1,13 @@
 ---
+# cert: {name, sans: "a,b,c", need: "a,b" (optional: names an own certificate must cover; default sans)}
 - name: "Certificate {{ cert.name }}"
   ansible.builtin.command:
-    argv: ["{{ role_path }}/files/issue.sh", "{{ hpc_secrets_dir }}/pki", "{{ cert.name }}", "{{ hpc_cluster_name }}", "{{ cert.sans }}"]
+    argv: ["{{ role_path }}/files/issue.sh", "{{ hpc_secrets_dir }}/pki", "{{ cert.name }}", "{{ hpc_cluster_name }}",
+           "{{ cert.sans }}", "{{ cert.need | default(cert.sans) }}"]
   register: _issue
-  changed_when: "'issued' in _issue.stdout"
+  changed_when: "'issued' in _issue.stdout or 'installed' in _issue.stdout"
+
+- name: "Certificate {{ cert.name }}: warning"
+  ansible.builtin.debug:
+    msg: "{{ _issue.stdout_lines | select('match', '^warning:') | list }}"
+  when: "'warning:' in _issue.stdout"

@@ -1,0 +1,136 @@
+---
+# Roll back the deployment (docs/rollback.md). Modes:
+#   list       show restore points (etcd snapshots, the last recorded version
+#              change, RKE2 versions in the repository). Changes nothing.
+#   previous   go back to the state before the last version change
+#              (site.yml -e hpc_rke2_upgrade=true), or to any snapshot with
+#              -e hpc_rollback_snapshot=<name>: etcd is restored and RKE2 put
+#              back to the version of that snapshot. Whole cluster, no --limit.
+#   uninstall  remove what site.yml installed: every node, or only some
+#              compute nodes with --limit (they also leave the cluster).
+# previous and uninstall need -e hpc_rollback_confirm=<hpc_cluster_name>.
+# Every play is any_errors_fatal: one failed check or step stops all nodes.
+#   ansible-playbook -i inventories/<site>/hosts.yml rollback.yml -e hpc_rollback_mode=list
+#   ansible-playbook -i ... rollback.yml -e hpc_rollback_mode=previous -e hpc_rollback_confirm=hpc
+#   ansible-playbook -i ... rollback.yml -e hpc_rollback_mode=uninstall -e hpc_rollback_confirm=hpc [--limit cn003]
+- name: Checks
+  hosts: rke2_servers:rke2_agents
+  any_errors_fatal: true
+  gather_facts: true
+  gather_subset: [min]
+  become: false
+  tasks:
+    - name: Mode, confirmation, nodes (every host checks; one failure stops all)
+      ansible.builtin.include_role:
+        name: rollback
+
+# ---- list -----------------------------------------------------------------------------
+- name: Restore points
+  hosts: rke2_servers
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  tasks:
+    - name: List
+      ansible.builtin.include_role:
+        name: rollback
+        tasks_from: list
+      when: hpc_rollback_mode | default('') == 'list'
+
+# ---- previous ---------------------------------------------------------------------------
+- name: "previous: plan and checks"
+  hosts: rke2_servers
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Plan
+      ansible.builtin.include_role:
+        name: rollback
+        tasks_from: previous-plan
+      when: hpc_rollback_mode | default('') == 'previous'
+
+- name: "previous: restore the server"
+  hosts: rke2_servers
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Restore
+      ansible.builtin.include_role:
+        name: rollback
+        tasks_from: previous-server
+      when: hpc_rollback_mode | default('') == 'previous'
+
+- name: "previous: compute nodes on the server's version"
+  hosts: rke2_agents
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Version
+      ansible.builtin.include_role:
+        name: rollback
+        tasks_from: previous-agents
+      when: hpc_rollback_mode | default('') == 'previous'
+
+- name: "previous: refresh the compute nodes, wait for every node"
+  hosts: rke2_servers
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Refresh
+      when: hpc_rollback_mode | default('') == 'previous'
+      block:
+        - name: Restart the compute nodes' watchers
+          ansible.builtin.include_role:
+            name: rke2
+            tasks_from: refresh-agents
+        - name: Every node, next steps
+          ansible.builtin.include_role:
+            name: rollback
+            tasks_from: previous-done
+
+# ---- uninstall ------------------------------------------------------------------------------
+- name: "uninstall: final snapshot"
+  hosts: rke2_servers
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Snapshot
+      ansible.builtin.include_role:
+        name: rollback
+        tasks_from: uninstall-snapshot
+      when: hpc_rollback_mode | default('') == 'uninstall' and hpc_rollback_final_snapshot | default(true) | bool
+
+- name: "uninstall: compute nodes"
+  hosts: rke2_agents
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Uninstall
+      ansible.builtin.include_role:
+        name: rollback
+        tasks_from: uninstall-node
+      when: hpc_rollback_mode | default('') == 'uninstall'
+
+- name: "uninstall: admin node"
+  hosts: rke2_servers
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  tasks:
+    - name: Uninstall
+      when: hpc_rollback_mode | default('') == 'uninstall'
+      block:
+        - name: Node
+          ansible.builtin.include_role:
+            name: rollback
+            tasks_from: uninstall-node
+        - name: Admin services
+          ansible.builtin.include_role:
+            name: rollback
+            tasks_from: uninstall-admin

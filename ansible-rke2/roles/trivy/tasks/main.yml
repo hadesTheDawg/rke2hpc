@@ -1,0 +1,58 @@
+---
+# Trivy operator (docs/trivy.md): vulnerability, configuration, RBAC and
+# exposed-secret reports as Kubernetes objects. It reports; it blocks nothing
+# (no admission webhook). Everything comes from the internal registries: the
+# operator and scanner images, and the vulnerability DB the bundle carries.
+- name: Admin tools
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: admin-tools
+
+- name: Namespace
+  ansible.builtin.shell:
+    cmd: "set -o pipefail; {{ hpc_kubectl }} create namespace {{ hpc_trivy_namespace }} --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -"
+  register: _ns
+  changed_when: "'created' in _ns.stdout"
+
+# Operator and scan jobs run on the admin node, like every platform service.
+- name: Pin it to the admin node
+  ansible.builtin.include_role:
+    name: hpc_common
+    tasks_from: pin-namespaces
+
+# Scanners pull images themselves (not through containerd), so they get the
+# CA bundle mounted (/etc/hpc-ca) to trust the internal registries.
+- name: Trusted CAs for the scan jobs
+  ansible.builtin.shell:
+    cmd: >-
+      set -o pipefail;
+      {{ hpc_kubectl }} -n {{ hpc_trivy_namespace }} create configmap hpc-ca --from-file=ca.crt=/etc/pki/hpc/ca.crt
+      --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -
+  register: _ca
+  changed_when: "'configured' in _ca.stdout or 'created' in _ca.stdout"
+
+- name: Chart values
+  ansible.builtin.template:
+    src: values.yaml.j2
+    dest: /etc/hpc/trivy-operator-values.yaml
+    mode: "0600"
+  no_log: true
+
+- name: trivy-operator
+  ansible.builtin.command:
+    argv:
+      - /usr/local/libexec/hpc/hpc-helm-release
+      - "{{ hpc_trivy_namespace }}"
+      - trivy-operator
+      - "{{ hpc_data_root }}/bundle/charts/trivy-operator-{{ hpc_trivy_operator_chart_version }}.tgz"
+      - /etc/hpc/trivy-operator-values.yaml
+      - 10m
+  register: _trel
+  changed_when: "'deployed' in _trel.stdout"
+
+# A new vulnerability DB in the registry (hpc_trivy_db_refresh) is picked up by
+# the next scans; rescan everything now instead of waiting for the report TTL.
+- name: Rescan with the refreshed vulnerability DB
+  ansible.builtin.command: "{{ hpc_kubectl }} delete vulnerabilityreports.aquasecurity.github.io --all -A --wait=false"
+  when: hpc_trivy_db_refresh | bool
+  changed_when: true

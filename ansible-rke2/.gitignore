@@ -1,4 +1,10 @@
 # downloaded bundle (large) and per-site generated state
 .bundle/
 inventories/*/secrets/
+# the site's own RPMs (import-rpms.sh): binaries, kept next to the inventory but not in git
+inventories/*/rpms/
 *.retry
+# run logs (hpc_run_log); .logs/ (ansible.cfg log_path) has its own .gitignore
+inventories/*/logs/
+# Harvester's cloud config for guest clusters and saved IdP metadata may hold credentials
+inventories/*/harvester-cloud-config

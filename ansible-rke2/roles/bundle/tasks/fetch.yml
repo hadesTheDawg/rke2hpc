@@ -6,7 +6,7 @@
     path: "{{ hpc_bundle_dir }}/{{ item }}"
     state: directory
     mode: "0755"
-  loop: [bin, dl, rke2, charts, images/system, images/user, rpms]
+  loop: [bin, dl, rke2, charts, ui-plugins, images/system, images/user, rpms]
   delegate_to: localhost
 
 # ---- binaries --------------------------------------------------------------
@@ -64,19 +64,16 @@
                 | select('search', ' ' ~ item ~ '$') | first | split | first }}"
     mode: "0644"
     timeout: 600
-  loop:
-    - "rke2-images-core.linux-{{ hpc_arch }}.tar.zst"
-    - "rke2-images-{{ hpc_rke2_cni }}.linux-{{ hpc_arch }}.tar.zst"
+  loop: "{{ _hpc_rke2_tarballs }}"
   delegate_to: localhost
 
 - name: Drop tarballs of other versions/CNIs
   ansible.builtin.shell:
     cmd: |
+      keep=" {{ _hpc_rke2_tarballs | join(' ') }} "
       for f in rke2/*.tar.zst; do
-        case "$(basename "$f")" in
-          rke2-images-core.linux-{{ hpc_arch }}.tar.zst|rke2-images-{{ hpc_rke2_cni }}.linux-{{ hpc_arch }}.tar.zst) ;;
-          *) rm -f "$f"; echo removed ;;
-        esac
+        [ -e "$f" ] || continue
+        case "$keep" in *" $(basename "$f") "*) ;; *) rm -f "$f"; echo removed ;; esac
       done
       echo "{{ hpc_rke2_version }}" > rke2/VERSION
     chdir: "{{ hpc_bundle_dir }}"
@@ -85,23 +82,71 @@
   delegate_to: localhost
 
 # ---- helm charts ------------------------------------------------------------
+# Every chart lands in charts/; the admin node serves them as a chart
+# repository (docs/charts.md). Charts no longer listed are removed.
 - name: Helm charts
   ansible.builtin.get_url:
     url: "{{ item }}"
     dest: "{{ hpc_bundle_dir }}/charts/{{ item | basename }}"
     mode: "0644"
-  loop:
-    - "https://releases.rancher.com/server-charts/stable/rancher-{{ hpc_rancher_version }}.tgz"
-    - "https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner/releases/download/nfs-subdir-external-provisioner-{{ hpc_nfs_provisioner_chart_version }}/nfs-subdir-external-provisioner-{{ hpc_nfs_provisioner_chart_version }}.tgz"
-    - "https://ceph.github.io/csi-charts/cephfs/ceph-csi-cephfs-{{ hpc_ceph_csi_chart_version }}.tgz"
+    timeout: 120
+  loop: "{{ hpc_charts }}"
+  delegate_to: localhost
+
+- name: Drop charts that are no longer listed
+  ansible.builtin.shell:
+    cmd: |
+      keep=" {{ hpc_charts | map('basename') | join(' ') }} "
+      for f in charts/*.tgz; do
+        [ -e "$f" ] || continue
+        case "$keep" in *" $(basename "$f") "*) ;; *) rm -f "$f"; echo "removed $f" ;; esac
+      done
+    chdir: "{{ hpc_bundle_dir }}"
+  register: _chprune
+  changed_when: _chprune.stdout | length > 0
+  delegate_to: localhost
+
+# ---- Rancher UI extensions (served by the admin node; docs/harvester.md) ----------
+- name: Harvester UI extension files
+  ansible.builtin.get_url:
+    url: "{{ _hpc_harvester_ui_base }}/extensions/harvester/{{ hpc_harvester_ui_version }}.tgz"
+    dest: "{{ hpc_bundle_dir }}/ui-plugins/harvester-{{ hpc_harvester_ui_version }}.tgz"
+    mode: "0644"
+    timeout: 300
+  when: hpc_bundle_harvester | bool
+  delegate_to: localhost
+
+- name: Drop UI extensions that are no longer wanted
+  ansible.builtin.shell:
+    cmd: |
+      for f in ui-plugins/*.tgz; do
+        [ -e "$f" ] || continue
+        [ "$(basename "$f")" = "{{ 'harvester-' ~ hpc_harvester_ui_version ~ '.tgz' if hpc_bundle_harvester | bool else '-' }}" ] \
+          || { rm -f "$f"; echo "removed $f"; }
+      done
+    chdir: "{{ hpc_bundle_dir }}"
+  register: _uiprune
+  changed_when: _uiprune.stdout | length > 0
   delegate_to: localhost
 
 # ---- container images -----------------------------------------------------------
+# The Trivy databases keep their tag while upstream replaces the content;
+# a cached copy is kept until hpc_trivy_db_refresh asks for today's.
+- name: Forget the cached Trivy databases (hpc_trivy_db_refresh)
+  ansible.builtin.shell:
+    cmd: |
+      rm -fv images/system/aquasec_trivy-db_*.tar images/system/aquasec_trivy-java-db_*.tar
+    chdir: "{{ hpc_bundle_dir }}"
+  register: _dbforget
+  changed_when: _dbforget.stdout | length > 0
+  when: hpc_trivy_db_refresh | bool
+  delegate_to: localhost
+
 - name: Container images
   ansible.builtin.command:
     argv: "{{ [role_path ~ '/files/fetch-images.sh', hpc_arch, hpc_bundle_dir ~ '/images/' ~ item.set] + item.refs }}"
   loop:
-    - {set: system, refs: "{{ hpc_images_system + (hpc_images_ceph if hpc_bundle_ceph | bool else []) }}"}
+    - {set: system, refs: "{{ _hpc_system_refs }}"}
     - {set: user, refs: "{{ hpc_images_user }}"}
   loop_control:
     label: "{{ item.set }} ({{ item.refs | length }} images)"
@@ -146,12 +191,5 @@
   ansible.builtin.copy:
     dest: "{{ hpc_bundle_dir }}/MANIFEST"
     mode: "0644"
-    content: |
-      arch={{ hpc_arch }}
-      rke2={{ hpc_rke2_version }}
-      rancher={{ hpc_rancher_version }}
-      keycloak={{ hpc_keycloak_version }}
-      registry={{ hpc_registry_version }}
-      ceph_csi={{ hpc_ceph_csi_chart_version }}
-      offline_repo={{ hpc_offline_repo }}
+    content: "{{ _hpc_manifest }}"
   delegate_to: localhost

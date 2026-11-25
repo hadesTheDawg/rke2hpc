@@ -1,14 +1,18 @@
 ---
 # Full deployment, in order. Every play is idempotent; re-run the whole file or
 # pick parts with --tags (pki, bundle, base, registry, nfs, rke2, platform,
-# ceph, keycloak, rancher, identity, tenants, accounting, backup).
+# ceph, keycloak, rancher, identity, upstream_idp, tenants, accounting, backup,
+# trivy, harvester).
 #   ansible-playbook -i inventories/<site>/hosts.yml site.yml
+# Preview what a run would change on a deployed site (docs/operations.md):
+#   ansible-playbook -i inventories/<site>/hosts.yml site.yml --check --diff
 # Switch a component off with hpc_enable_<name>: false (docs/variables.md).
 # To add a component: create roles/<name>, add a play below (docs/extending.md).
 
 - name: Preflight (facts, inventory and network checks)
   hosts: rke2_servers:rke2_agents
   gather_facts: true
+  gather_subset: [min, network]   # OS, architecture, user, interfaces: all the deployment reads
   become: false
   tags: [always]
   roles: [preflight]
@@ -17,7 +21,7 @@
   hosts: localhost
   connection: local
   gather_facts: false
-  tags: [pki]
+  tags: [always, pki]   # cheap and local; later plays read its files
   roles: [pki]
 
 - name: Offline bundle
@@ -82,6 +86,9 @@
     - role: rke2
       when: hpc_enable_rke2 | bool
 
+# Waits for the nodes that got through RKE2 in this run. A compute node that
+# failed or was unreachable dropped out of the run; it is listed, and with
+# hpc_compute_max_failed >= 0 too many of them stop the run here.
 - name: All nodes Ready
   hosts: rke2_servers
   gather_facts: false
@@ -89,15 +96,41 @@
   tags: [rke2]
   roles: [hpc_common]
   tasks:
-    - name: Wait for every node
+    - name: Nodes in this run
+      ansible.builtin.set_fact:
+        _live: "{{ hpc_cluster_hosts | select('in', _done) | list }}"
+        _lost: "{{ hpc_compute_hosts | reject('in', _done) | select('in', _targeted) | list }}"
+      vars:
+        _done: "{{ hpc_cluster_hosts | map('extract', hostvars) | selectattr('_hpc_rke2_done', 'defined')
+                   | map(attribute='inventory_hostname') | list }}"
+        _targeted: "{{ query('ansible.builtin.inventory_hostnames', ansible_limit | default('all', true)) }}"
+      when: hpc_enable_rke2 | bool
+
+    - name: Compute nodes that dropped out of this run
+      ansible.builtin.debug:
+        msg: "WARNING: not deployed in this run (failed or unreachable): {{ _lost | join(', ') }}"
+      when: hpc_enable_rke2 | bool and _lost | length > 0
+
+    - name: Too many compute nodes failed (hpc_compute_max_failed)
+      ansible.builtin.assert:
+        that: hpc_compute_max_failed | int < 0 or _lost | length <= hpc_compute_max_failed | int
+        fail_msg: >-
+          {{ _lost | length }} compute node(s) failed, more than hpc_compute_max_failed={{ hpc_compute_max_failed }}:
+          {{ _lost | join(', ') }}. Fix them and re-run; nothing after the RKE2 stage was changed.
+      when: hpc_enable_rke2 | bool
+
+    - name: Wait for the nodes of this run
       ansible.builtin.shell:
-        cmd: "{{ hpc_kubectl }} get nodes --no-headers | awk '$2==\"Ready\"' | wc -l"
+        cmd: >-
+          {{ hpc_kubectl }} get nodes -o jsonpath='{range .items[*]}{.metadata.name} {.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}'
+          | awk '$2=="True" {print $1}'
       register: _ready
-      until: _ready.stdout | int == hpc_cluster_hosts | length
+      until: _live | difference(_ready.stdout_lines) | length == 0
       retries: 120
       delay: 5
       changed_when: false
-      when: hpc_enable_rke2 | bool
+      check_mode: false
+      when: hpc_enable_rke2 | bool and _live | length > 0
 
 - name: Cluster platform, storage, identity, projects
   hosts: rke2_servers
@@ -109,6 +142,63 @@
     - {role: keycloak, when: hpc_enable_keycloak | bool, tags: [keycloak]}
     - {role: rancher, when: hpc_enable_rancher | bool, tags: [rancher]}
     - {role: identity, when: hpc_enable_identity | bool, tags: [identity]}
+    - {role: upstream_idp, when: hpc_enable_identity | bool and hpc_enable_upstream_idp | bool, tags: [identity, upstream_idp]}
     - {role: tenants, when: hpc_enable_tenants | bool, tags: [tenants]}
     - {role: accounting, when: hpc_enable_accounting | bool, tags: [accounting]}
     - {role: backup, when: hpc_enable_backup | bool, tags: [backup]}
+    - {role: trivy, when: hpc_enable_trivy | bool, tags: [trivy]}
+    - {role: harvester, when: hpc_enable_harvester | bool, tags: [harvester]}
+
+# One line per run in hpc_run_log (inventories/<site>/logs/runs.log); the full
+# output of every run is in .logs/ansible.log (ansible.cfg).
+- name: Nodes that finished the run
+  hosts: rke2_servers:rke2_agents
+  gather_facts: false
+  become: false
+  tags: [always]
+  tasks:
+    - name: Finished
+      ansible.builtin.set_fact:
+        _hpc_finished: true
+
+- name: Run record
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  become: false
+  tags: [always]
+  roles: [hpc_common]
+  tasks:
+    - name: Log directory
+      ansible.builtin.file:
+        path: "{{ hpc_run_log | dirname }}"
+        state: directory
+        mode: "0700"
+      check_mode: false
+    - name: Deployment revision
+      ansible.builtin.command: git -C "{{ playbook_dir }}" describe --always --dirty
+      register: _rev
+      changed_when: false
+      failed_when: false
+      check_mode: false
+    - name: Append to the run log
+      ansible.builtin.shell:
+        cmd: printf '%s\n' "$LINE" >> "{{ hpc_run_log }}"
+      environment:
+        LINE: >-
+          {{ now(utc=true).strftime('%Y-%m-%dT%H:%M:%SZ') }}
+          user={{ lookup('ansible.builtin.env', 'USER') | default('?', true) }}
+          playbook=site.yml
+          rev={{ _rev.stdout | default('', true) or '-' }}
+          tags={{ ansible_run_tags | join(',') }}
+          skip={{ ansible_skip_tags | join(',') or '-' }}
+          limit={{ ansible_limit | default('-', true) }}
+          check={{ ansible_check_mode | lower }}
+          finished={{ _fin | length }}/{{ _tgt | length }}
+          {{ ('not_finished=' ~ (_tgt | difference(_fin) | join(','))) if _tgt | difference(_fin) | length > 0 else '' }}
+      vars:
+        _tgt: "{{ query('ansible.builtin.inventory_hostnames', ansible_limit | default('rke2_servers:rke2_agents', true))
+                  | select('in', hpc_cluster_hosts) | list }}"
+        _fin: "{{ _tgt | map('extract', hostvars) | selectattr('_hpc_finished', 'defined') | map(attribute='inventory_hostname') | list }}"
+      changed_when: false
+      check_mode: false

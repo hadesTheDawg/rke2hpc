@@ -70,3 +70,49 @@ Found on the way: right after an etcd restore, watchers on the compute nodes
 (Calico, a CoreDNS replica) kept the pre-restore view and missed new objects.
 New Services did not resolve and network policy was stale until they
 restarted. The restore now recreates those pods.
+
+## Own certificates, re-runs, site RPMs, rollback (2026-11-24)
+
+Started from the lab as the 2026-11-15 tests left it (cluster deployed,
+RKE2 v1.36.6+rke2r1). A made-up "Example Corp" root and issuing CA signed
+`own/ingress.crt` (Rancher, Keycloak) and `own/admin.crt` (registries,
+repository); `own/ca.crt` held both CA certificates.
+
+| Step | Result |
+|------|--------|
+| `site.yml` with the own certificates | installed; every endpoint serves them (new verify checks), the loopback push endpoints keep the internal `local` certificate. RKE2 not reinstalled, images not re-published. Bundle fetched once (new manifest format) |
+| `site.yml` again | 89 s; bundle and image publishing skipped, nothing changed on the compute nodes |
+| `verify.yml` | Rancher could not log users in through Keycloak: it reads the trust bundle only at start. Fixed: Rancher and Keycloak restart when their pods are older than the bundle. Then **108 checks passed** |
+| `import-rpms.sh` with an x86_64 RPM | refused on the admin node: "architecture x86_64, the nodes are aarch64" |
+| `import-rpms.sh --install hpc-hello,tree` (site-built RPM + one from the distro) | `hpc-local` on every node, both installed everywhere |
+| import `hpc-hello` 1.1, `--install hpc-hello --on c1` | c1 updated to 1.1, c2 kept 1.0 |
+| `site.yml -e hpc_rke2_version=v1.36.6+rke2r2` | RKE2 left at r1 on every node, with the notice; the r2 images published |
+| same with `-e hpc_rke2_upgrade=true` and `hpc_local_packages_compute: [words]` | 236 s: snapshot `hpc-pre-upgrade-*` (local + backup dir), record written (and copied to `secrets/state/rollback.json`), server then agents on r2, `words` on the compute nodes. verify: 108 passed |
+| ConfigMap `rollback-marker` created, then `rollback.yml` previous | back on r1 everywhere, marker gone (state of the pre-upgrade snapshot) |
+| previous with `hpc_rollback_snapshot=hpc-pre-rollback-*` and `hpc_rollback_rke2_version=v1.36.6+rke2r2` (undo the rollback) | r2 again, marker back |
+| previous (defaults) again, `site.yml`, `verify.yml` | r1; site.yml changed nothing on the compute nodes; 108 passed |
+| node re-provisioned (`lab.sh reprovision c3`), `site.yml` | c3 back with RKE2 at exactly `hpc_rke2_version`; its original `chrony.conf` and the repositories it disabled recorded |
+| `rollback.yml` uninstall `--limit c3` | c3: RKE2 RPMs and state gone, Rocky repositories enabled again, original `chrony.conf` back, hosts block and CA removed; Node deleted from the cluster. `site.yml` added it back |
+| `rollback.yml` uninstall (all) | final snapshot `hpc-pre-uninstall-*` in the backup dir; every service and file of the deployment gone from a1; warnings on c1, c2, a1 (set up before originals were recorded). Re-run after a failed run finished cleanly |
+| `site.yml` after the uninstall, `verify.yml` | 288 s: the backup dir's newest `hpc-backup-*` restored, the old cluster back (as the uninstall notice says); 108 passed |
+| own certificates removed again, `site.yml`, `verify.yml` | internal certificates re-issued (new keys), Rancher and Keycloak restarted for the smaller bundle; 108 passed |
+
+Found on the way:
+
+- The rollback checks ran `run_once` on the admin node. When a check
+  failed, only that host stopped: the compute nodes went on to the next
+  plays. Every rollback play is now `any_errors_fatal`.
+- Rancher could not log users in through Keycloak after the CA bundle
+  changed: it reads the bundle only at start. Rancher and Keycloak now
+  restart when their pods are older than `/etc/pki/hpc/ca.crt`.
+- After a restore onto a cluster whose compute nodes were also wiped
+  (uninstall all, then `site.yml`), the refresh waited for platform pods on
+  nodes that had not joined yet. It now refreshes only compute nodes that
+  have rke2-agent.
+- A comment in the bundle manifest template was part of the manifest, so
+  editing it meant a new download. Comments are now Jinja comments.
+- Going back from an own ingress certificate to the internal one, Traefik
+  kept serving the old one for Keycloak: it picks by SNI from every ingress
+  secret, and Rancher's secret (updated later, by the rancher role) still
+  covered both names. The platform role now updates Rancher's and
+  Keycloak's ingress secrets together.

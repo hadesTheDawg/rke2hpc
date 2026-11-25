@@ -1,0 +1,117 @@
+---
+# Admin node, after uninstall-node.yml: the services site.yml put there.
+- name: Services of the deployment
+  ansible.builtin.systemd_service:
+    name: "{{ item }}"
+    state: stopped
+    enabled: false
+  loop: [hpc-acct.service, hpc-backup.timer, hpc-backup.service,
+         hpc-registry@system-ro, hpc-registry@system-rw, hpc-registry@user-ro, hpc-registry@user-rw]
+  failed_when: false
+
+- name: Units, tools, configuration
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop:
+    - /etc/systemd/system/hpc-acct.service
+    - /etc/systemd/system/hpc-backup.service
+    - /etc/systemd/system/hpc-backup.timer
+    - /etc/systemd/system/hpc-registry@.service
+    - /etc/hpc-registry
+    - /usr/local/bin/registry
+    - /usr/local/sbin/hpc-sync
+    - /usr/local/sbin/hpc-acct
+    - /usr/local/sbin/hpc-backup
+    - /usr/sbin/hpc-acct
+    - /usr/local/libexec/hpc
+    - /usr/local/lib/hpc
+    - /etc/hpc
+    - /etc/pki/hpc
+    - /etc/dnsmasq.d/hpc.conf
+    - /etc/exports.d/hpc.exports
+
+- name: systemd reload
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+
+- name: Registry account
+  ansible.builtin.user:
+    name: hpc-registry
+    state: absent
+
+- name: Registry group
+  ansible.builtin.group:
+    name: hpc-registry
+    state: absent
+
+# ---- repository server (nginx) --------------------------------------------------------
+- name: nginx stopped
+  ansible.builtin.systemd_service:
+    name: nginx
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: Original nginx.conf
+  ansible.builtin.shell:
+    cmd: |
+      grep -q 'managed by ansible (hpc' /etc/nginx/nginx.conf 2>/dev/null || exit 0
+      for o in /var/lib/hpc/base/orig/etc/nginx/nginx.conf /etc/nginx/nginx.conf.default; do
+        [ -f "$o" ] && cp -f "$o" /etc/nginx/nginx.conf && echo "restored from $o" && exit 0
+      done
+      echo "no original"
+  register: _rb_nginx
+  changed_when: "'restored' in _rb_nginx.stdout"
+
+- name: Records of the base role
+  ansible.builtin.file:
+    path: /var/lib/hpc/base
+    state: absent
+
+# ---- DNS, NFS ----------------------------------------------------------------------------
+- name: dnsmasq stopped
+  ansible.builtin.systemd_service:
+    name: dnsmasq
+    state: stopped
+    enabled: false
+  failed_when: false
+
+- name: NFS exports
+  ansible.builtin.shell:
+    cmd: |
+      systemctl is-active --quiet nfs-server || exit 0
+      exportfs -ra
+      if [ -z "$(exportfs -s)" ]; then systemctl disable --now nfs-server; echo "nfs-server stopped (nothing exported)"; fi
+  register: _rb_nfs
+  changed_when: true
+
+# ---- SELinux labels and data ---------------------------------------------------------------
+- name: SELinux file contexts of the deployment
+  ansible.builtin.shell:
+    cmd: |
+      for p in "{{ hpc_data_root }}/www" "{{ hpc_data_root }}/bundle/rpms" "{{ hpc_data_root }}/local-rpms" \
+               "{{ hpc_data_root }}/charts" "{{ hpc_data_root }}/ui-plugins" "{{ hpc_keycloak_db_dir }}"; do
+        semanage fcontext -d "$p(/.*)?" 2>/dev/null && echo "removed $p"
+      done; true
+  register: _rb_fc
+  changed_when: _rb_fc.stdout | length > 0
+
+- name: Data that site.yml rebuilds
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ [hpc_data_root, '/var/lib/hpc']
+            + ([hpc_keycloak_db_dir] if not (hpc_persist_root and hpc_keycloak_db_dir.startswith(hpc_persist_root ~ '/')) else []) }}"
+  when: hpc_rollback_purge_data | bool
+
+- name: What is left
+  ansible.builtin.debug:
+    msg:
+      - "{{ hpc_admin_host }}: RKE2, registries, repository, DNS, NFS exports and tools removed"
+      - "{{ 'deleted: ' ~ hpc_data_root ~ ', /var/lib/hpc' if hpc_rollback_purge_data | bool
+           else 'kept (-e hpc_rollback_purge_data=true deletes them): ' ~ hpc_data_root ~ ' (bundle, registry storage), /var/lib/hpc' }}"
+      - "never touched: the exported directories ({{ hpc_nfs_home_export }}, {{ hpc_nfs_k8s_export }}){{ (', ' ~ hpc_persist_root) if hpc_persist_root else '' }}, and {{ hpc_secrets_dir }} on the deployer"
+      - "{{ ('NOTE: ' ~ hpc_backup_dir ~ '/etcd holds hpc-backup-* snapshots. site.yml restores the newest one into a new admin node, '
+             ~ 'which brings this cluster back. For a new, empty cluster move that directory away first, or set hpc_rke2_restore: false.')
+            if hpc_backup_dir else 'site.yml now builds a new cluster (same CA, tokens and passwords from secrets/)' }}"

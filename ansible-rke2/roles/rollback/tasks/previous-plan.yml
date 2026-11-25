@@ -1,0 +1,73 @@
+---
+# Admin node, before anything changes: pick the snapshot and the RKE2 version
+# to go back to, and check that both are there.
+- name: Restore points
+  ansible.builtin.include_tasks: inspect.yml
+
+- name: Snapshot to restore
+  ansible.builtin.set_fact:
+    _rb_snapshot: >-
+      {{ hpc_rollback_snapshot if hpc_rollback_snapshot.startswith('/')
+         else (_rb_snaps | map(attribute='path') | select('match', '.*/' ~ (hpc_rollback_snapshot | regex_escape) ~ '$') | first | default(''))
+           if hpc_rollback_snapshot
+         else (_rb_snaps | map(attribute='path') | select('match', '.*/' ~ ((_rb_state.snapshot | default('') | basename) | regex_escape) ~ '$')
+               | first | default('')) if _rb_state.snapshot | default('') | length > 0
+         else '' }}
+
+- name: A snapshot was found
+  ansible.builtin.assert:
+    that: _rb_snapshot | length > 0
+    fail_msg: >-
+      {{ ('snapshot ' ~ hpc_rollback_snapshot ~ ' not found') if hpc_rollback_snapshot
+         else ('the snapshot recorded before the last version change (' ~ (_rb_state.snapshot | basename) ~ ') is gone')
+           if _rb_state.snapshot is defined
+         else 'no version change is recorded, so there is no default restore point' }}.
+      Choose one with -e hpc_rollback_snapshot=<name>; rollback.yml -e hpc_rollback_mode=list shows them.
+
+- name: Snapshot file
+  ansible.builtin.stat:
+    path: "{{ _rb_snapshot }}"
+  register: _rb_snapstat
+  failed_when: not _rb_snapstat.stat.exists or not _rb_snapstat.stat.isreg
+
+- name: RKE2 version to run afterwards
+  ansible.builtin.set_fact:
+    _rb_version: >-
+      {{ hpc_rollback_rke2_version if hpc_rollback_rke2_version
+         else _rb_state.rke2_from if (_rb_state.snapshot | default('') | basename) == (_rb_snapshot | basename)
+         else _rb_installed }}
+
+- name: Version format
+  ansible.builtin.assert:
+    that: _rb_version is match('^v[0-9]+\.[0-9]+\.[0-9]+\+rke2r[0-9]+$')
+    fail_msg: "RKE2 version '{{ _rb_version }}' is not like v1.36.6+rke2r1"
+
+- name: Version change
+  ansible.builtin.set_fact:
+    _rb_rpm_version: "{{ _rb_version[1:] | replace('+', '~') }}"
+    _rb_change: "{{ _rb_version != _rb_installed }}"
+
+- name: "RKE2 {{ _rb_version }} in the package repository"
+  ansible.builtin.command:
+    argv: [dnf, -q, list, --showduplicates, "rke2-server-{{ _rb_rpm_version }}", "rke2-agent-{{ _rb_rpm_version }}"]
+  register: _rb_avail
+  changed_when: false
+  check_mode: false
+  failed_when: false
+  when: _rb_change | bool
+
+- name: Packages available
+  ansible.builtin.assert:
+    that: _rb_avail.rc == 0 and 'rke2-agent' in _rb_avail.stdout and 'rke2-server' in _rb_avail.stdout
+    fail_msg: >-
+      rke2-server/rke2-agent {{ _rb_rpm_version }} are not in the repository. Bring them back with
+      bundle.yml -e hpc_rke2_version={{ _rb_version }} -e hpc_bundle_force=true (needs internet), or with
+      ./import-rpms.sh (the rke2-server, rke2-agent, rke2-common RPMs of that version).
+  when: _rb_change | bool
+
+- name: Plan
+  ansible.builtin.debug:
+    msg:
+      - "restore {{ _rb_snapshot }} (taken {{ '%Y-%m-%d %H:%M' | strftime(_rb_snapstat.stat.mtime | int) }})"
+      - "RKE2: {{ (_rb_installed ~ ' -> ' ~ _rb_version) if _rb_change else (_rb_version ~ ' (unchanged)') }}"
+      - "a snapshot of the current state is saved first (hpc-pre-rollback-*)"

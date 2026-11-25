@@ -1,0 +1,3 @@
+# ansible.cfg log_path writes here; the directory must exist, its contents stay out of git
+*
+!.gitignore

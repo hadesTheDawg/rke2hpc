@@ -37,6 +37,13 @@ hpc_enable_identity: true      # Keycloak realm/clients, Rancher login
 hpc_enable_tenants: true       # the flat file
 hpc_enable_accounting: true    # job accounting (measures only)
 hpc_enable_backup: "{{ hpc_backup_dir | length > 0 }}"   # etcd + accounting backups of the admin node
+hpc_enable_charts_repo: true   # the bundle's helm charts as a chart repository on the admin node (+ Rancher catalog)
+# Keycloak brokers the site's identity provider (docs/upstream-idp.md); on when one is configured
+hpc_enable_upstream_idp: >-
+  {{ (hpc_upstream_oidc_config_file | length > 0) or (hpc_upstream_oidc_discovery_url | length > 0)
+     or (hpc_upstream_oidc_issuer | length > 0) or (hpc_upstream_oidc_spoof | bool) }}
+hpc_enable_trivy: false        # Trivy operator: vulnerability/config reports, reports only (docs/trivy.md)
+hpc_enable_harvester: false    # Harvester integration: Rancher UI extension, guest-cluster cloud provider (docs/harvester.md)
 
 # =============================================================================
 # Site identity and platform
@@ -77,7 +84,8 @@ _hpc_admin_facts: "{{ hostvars[hpc_admin_host]['ansible_facts'] }}"
 hpc_admin_ip: "{{ hostvars[hpc_admin_host]['hpc_mgmt_ip'] }}"
 
 # =============================================================================
-# Versions (bump, then re-run bundle.yml + site.yml)
+# Versions (bump, then re-run bundle.yml + site.yml; installed RKE2 nodes
+# change version only with -e hpc_rke2_upgrade=true, see docs/rollback.md)
 # =============================================================================
 hpc_rke2_version: v1.36.6+rke2r1
 hpc_rke2_cni: canal            # canal enforces NetworkPolicy; pod iface support is wired for canal
@@ -90,6 +98,16 @@ hpc_kubelogin_version: v1.36.4
 hpc_nfs_provisioner_chart_version: 4.0.18
 hpc_nfs_provisioner_image_tag: v4.0.2
 hpc_ceph_csi_chart_version: 3.18.2
+hpc_trivy_operator_chart_version: 0.38.1   # aquasecurity/trivy-operator chart
+hpc_trivy_operator_version: 0.36.1         # its appVersion (operator image tag)
+hpc_trivy_version: 0.76.1                  # the scanner image the chart uses
+hpc_trivy_node_collector_version: 0.3.1
+hpc_harvester_ui_version: 1.9.1            # Harvester UI extension for Rancher (needs Rancher >= 2.15)
+# RKE2 on a node that already has it is never reinstalled or changed. To move
+# an installed cluster to hpc_rke2_version (up or down), run site.yml once with
+# -e hpc_rke2_upgrade=true: it snapshots etcd first, so rollback.yml can return.
+hpc_rke2_upgrade: false
+_hpc_rke2_rpm_version: "{{ hpc_rke2_version[1:] | replace('+', '~') }}"   # v1.36.6+rke2r1 -> 1.36.6~rke2r1
 
 # =============================================================================
 # Service names (all resolve to the admin node's management address)
@@ -122,6 +140,18 @@ hpc_coredns_forward_domain: true  # cluster DNS forwards {{ hpc_domain }} to the
 hpc_manage_time: true          # admin node serves time (chrony); other nodes follow it
 hpc_ntp_servers: []            # upstream NTP for the admin node, if the site has one
 
+# ---- the site's own RPMs (docs/rpms.md; add them with ./import-rpms.sh) ----------
+# Every *.rpm in this directory on the deployer becomes the repository
+# "hpc-local", served by the admin node to every node (next to hpc-offline).
+hpc_local_rpms_dir: "{{ hpc_site_dir }}/rpms"
+# Unsigned RPMs are normal for site builds. To check signatures, put the public
+# key into the rpms directory and name it here (e.g. RPM-GPG-KEY-mysite).
+hpc_local_rpms_gpgkey: ""
+# Installed by site.yml (base role); names from any enabled repository.
+hpc_local_packages: []           # every node
+hpc_local_packages_admin: []     # admin node only
+hpc_local_packages_compute: []   # compute nodes only
+
 # =============================================================================
 # Storage
 # =============================================================================
@@ -140,6 +170,7 @@ hpc_backup_keep: 48               # backups of each kind kept in hpc_backup_dir
 hpc_rke2_restore: true            # re-provisioned admin node (no etcd): restore the newest snapshot
 hpc_nfs_home_export: "{{ (hpc_persist_root ~ '/home') if hpc_persist_root else '/c/home' }}"   # exported from the admin node (when hpc_enable_nfs_server)
 hpc_nfs_k8s_export: "{{ (hpc_persist_root ~ '/k8s') if hpc_persist_root else '/c/k8s' }}"      # backs the NFS StorageClass
+hpc_keycloak_db_dir: "{{ (hpc_persist_root ~ '/keycloak-db') if hpc_persist_root else '/var/lib/hpc/keycloak-db' }}"   # Keycloak's PostgreSQL data
 # Give each export a fixed fsid. Required when the exports are on CephFS or
 # another network filesystem (they have no device number nfsd can use).
 hpc_nfs_export_fsid: "{{ hpc_persist_root | length > 0 }}"
@@ -186,10 +217,18 @@ hpc_platform_admin_users: [opsadmin]       # Keycloak-only accounts
 hpc_oidc_group_prefix: "oidc:"
 hpc_keycloak_allow_password_grant: true    # needed by verify.yml; review for production
 hpc_initial_passwords_temporary: false
-hpc_upstream_oidc_issuer: ""
-hpc_upstream_oidc_client_id: ""
+# ---- upstream identity provider (docs/upstream-idp.md) ----------------------------
+# Give one of: a saved openid-configuration file, its URL, or the issuer.
+hpc_upstream_oidc_config_file: ""       # e.g. "{{ hpc_site_dir }}/upstream-openid-configuration" (JSON or key: value lines)
+hpc_upstream_oidc_discovery_url: ""     # e.g. https://login.example.org/realms/staff/.well-known/openid-configuration
+hpc_upstream_oidc_issuer: ""            # <issuer>/.well-known/openid-configuration; with one of the above: must match it
+hpc_upstream_oidc_client_id: ""         # this Keycloak's client id at the provider; secret in secrets/upstream-oidc-client
 hpc_upstream_oidc_alias: upstream
-hpc_upstream_oidc_spoof: false
+hpc_upstream_oidc_display_name: Site login   # button on the Keycloak login page
+hpc_upstream_oidc_scopes: openid profile email
+hpc_upstream_oidc_username_claim: preferred_username   # claim that must equal the unix name in the flat file
+hpc_upstream_oidc_client_auth: ""       # client_secret_post | client_secret_basic; '' = what the provider supports
+hpc_upstream_oidc_spoof: false          # lab: a second realm in this Keycloak plays the provider
 hpc_tenant_pod_security: baseline
 hpc_tenant_default_cpu_request: 500m
 hpc_tenant_default_cpu_limit: "1"
@@ -199,6 +238,54 @@ hpc_tenant_default_cpu_hours: 1000         # allocation when the flat file gives
 hpc_platform_namespaces: [hpc-storage, keycloak, cattle-system, cattle-fleet-system, cattle-fleet-local-system]
 # not pinned: cluster-wide services, and the CSI node plugin (runs on every node)
 hpc_unpinned_namespaces: "{{ ['kube-system', 'kube-public', 'kube-node-lease', 'default', hpc_ceph_namespace] }}"
+
+# =============================================================================
+# Running the deployment (docs/operations.md)
+# =============================================================================
+# Compute nodes whose RKE2 configuration or version changes are restarted this
+# many at a time; the next ones start when the node's kubelet answers again.
+# 0 = all at once. First starts (new nodes) are never held back.
+hpc_agent_batch: 0
+hpc_agent_restart_timeout: 600   # seconds a restarted node may take to come back
+# A compute node that fails during a run drops out of it; the rest go on. With
+# 0 or more, the run stops after the RKE2 stage when more compute nodes than
+# this have failed or are unreachable. -1 = never stop for that.
+hpc_compute_max_failed: -1
+# One line per run of site.yml (time, user, tags, limit, result) on the deployer.
+hpc_run_log: "{{ hpc_site_dir }}/logs/runs.log"
+
+# =============================================================================
+# Helm charts (docs/charts.md)
+# =============================================================================
+# Every chart of the bundle, served as a chart repository by the admin node's
+# nginx (needs hpc_repo_port) and added to Rancher as a catalog.
+hpc_charts_url: "https://{{ hpc_admin_host }}.{{ hpc_domain }}:{{ hpc_repo_port }}/charts"
+hpc_charts_rancher_repo: hpc-local    # ClusterRepo name in Rancher (Apps)
+
+# =============================================================================
+# Trivy operator (docs/trivy.md): reports only, enforces nothing
+# =============================================================================
+hpc_trivy_namespace: trivy-system
+hpc_trivy_java_db: false          # also bundle the Java vulnerability DB (about 1 GB); without it JARs are not checked
+hpc_trivy_db_refresh: false       # -e hpc_trivy_db_refresh=true: download today's vulnerability DB and publish it
+hpc_trivy_target_namespaces: ""   # comma-separated; '' = every namespace
+hpc_trivy_exclude_namespaces: ""  # comma-separated glob patterns
+hpc_trivy_severity: UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL
+hpc_trivy_concurrent_scans: 2     # scan jobs at the same time (they run on the admin node)
+hpc_trivy_report_ttl: 24h         # reports are refreshed after this
+hpc_trivy_extra_values: {}        # merged into the chart values
+
+# =============================================================================
+# Harvester (docs/harvester.md); cannot be exercised in a VM lab
+# =============================================================================
+hpc_harvester_ui: true            # Rancher UI extension: manage Harvester clusters from Rancher
+hpc_harvester_guest: false        # this cluster's nodes are Harvester VMs: Harvester cloud provider + CSI
+# kubeconfig Harvester generates for a guest cluster (Harvester docs: "generate addon config")
+hpc_harvester_cloud_config_file: "{{ hpc_site_dir }}/harvester-cloud-config"
+hpc_harvester_ui_url: "https://{{ hpc_admin_host }}.{{ hpc_domain }}:{{ hpc_repo_port }}/ui-plugins/harvester"
+_hpc_harvester_rke2: >-
+  {{ {'cloud-provider-name': 'harvester', 'cloud-provider-config': '/etc/rancher/rke2/harvester-cloud-config'}
+     if (hpc_enable_harvester | bool and hpc_harvester_guest | bool) else {} }}
 
 # =============================================================================
 # Accounting
@@ -242,6 +329,10 @@ hpc_sync_env:
   UPSTREAM_OIDC_CLIENT_ID: "{{ hpc_upstream_oidc_client_id }}"
   UPSTREAM_OIDC_ALIAS: "{{ hpc_upstream_oidc_alias }}"
   UPSTREAM_OIDC_SPOOF: "{{ hpc_upstream_oidc_spoof | string | lower }}"
+  UPSTREAM_OIDC_DISPLAY_NAME: "{{ hpc_upstream_oidc_display_name }}"
+  UPSTREAM_OIDC_SCOPES: "{{ hpc_upstream_oidc_scopes }}"
+  UPSTREAM_OIDC_USERNAME_CLAIM: "{{ hpc_upstream_oidc_username_claim }}"
+  UPSTREAM_OIDC_CLIENT_AUTH: "{{ hpc_upstream_oidc_client_auth }}"
   UID_START: "{{ hpc_uid_start }}"
   GID_START: "{{ hpc_gid_start }}"
   TENANT_POD_SECURITY: "{{ hpc_tenant_pod_security }}"

@@ -1,13 +1,24 @@
 ---
-# Runs on the deployer (localhost). Private CA + service certificates + the
-# generated credentials, all under hpc_secrets_dir. To use a site CA, place
-# ca.crt/ca.key in <hpc_secrets_dir>/pki before the first run.
+# Runs on the deployer (localhost). CA + service certificates + the generated
+# credentials, all under hpc_secrets_dir (docs/certificates.md):
+#   pki/ca.crt + ca.key      issuing CA: generated, or put your site CA there before the first run
+#   pki/own/<name>.crt+.key  your own certificates (admin, ingress, apps): used as they are
+#   pki/own/ca.crt           the CA chain that signed them
+#   pki/ca-bundle.crt        what every node and service trusts: ca.crt + own/ca.crt
 - name: Secrets directories
   ansible.builtin.file:
     path: "{{ item }}"
     state: directory
     mode: "0700"
-  loop: ["{{ hpc_secrets_dir }}", "{{ hpc_secrets_dir }}/pki", "{{ hpc_secrets_dir }}/users"]
+  loop: ["{{ hpc_secrets_dir }}", "{{ hpc_secrets_dir }}/pki", "{{ hpc_secrets_dir }}/pki/own", "{{ hpc_secrets_dir }}/users"]
+
+# Passwords, keys and the uid map: readable by the deploying user only.
+- name: Nothing in the secrets directory is readable by others
+  ansible.builtin.command:
+    argv: [find, "{{ hpc_secrets_dir }}", (, -perm, -g=r, -o, -perm, -g=w, -o, -perm, -g=x, -o, -perm, -o=r, -o, -perm, -o=w,
+           -o, -perm, -o=x, ), -exec, chmod, go-rwx, "{}", ;, -print]
+  register: _perm
+  changed_when: _perm.stdout | length > 0
 
 - name: Site CA
   ansible.builtin.command:
@@ -20,17 +31,45 @@
     chdir: "{{ hpc_secrets_dir }}/pki"
     creates: "{{ hpc_secrets_dir }}/pki/ca.key"
 
+- name: Trust bundle (internal CA + the issuers of your own certificates)
+  ansible.builtin.shell:
+    cmd: |
+      set -eu
+      if [ -e own/ca.crt ]; then
+        openssl x509 -in own/ca.crt -noout 2>/dev/null || { echo "$PWD/own/ca.crt is not a PEM certificate" >&2; exit 1; }
+      fi
+      umask 077
+      { cat ca.crt; [ ! -s own/ca.crt ] || { echo; cat own/ca.crt; }; } | sed '/^[[:space:]]*$/d' >ca-bundle.crt.new
+      if cmp -s ca-bundle.crt.new ca-bundle.crt; then rm -f ca-bundle.crt.new; echo current
+      else mv -f ca-bundle.crt.new ca-bundle.crt; echo updated; fi
+    chdir: "{{ hpc_secrets_dir }}/pki"
+  register: _bundle
+  changed_when: "'updated' in _bundle.stdout"
+
+- name: No own certificate for the loopback endpoints
+  ansible.builtin.assert:
+    that: lookup('ansible.builtin.fileglob', hpc_secrets_dir ~ '/pki/own/local.*') | length == 0
+    fail_msg: "remove {{ hpc_secrets_dir }}/pki/own/local.*: the loopback certificate is always issued internally"
+
+# sans: what an issued certificate contains. need: the names clients use, which
+# an own certificate must cover (the rest are conveniences of the issued one).
 - name: Service certificates
   ansible.builtin.include_tasks: issue.yml
   loop:
-    # host services on the admin node: both registries and the repo server
+    # host services on the admin node: both registries (network side) and the repo server
     - name: admin
       sans: "{{ [hpc_registry_system_host, hpc_registry_user_host, hpc_admin_host ~ '.' ~ hpc_domain, hpc_admin_host, 'localhost', hpc_admin_ip, '127.0.0.1'] | join(',') }}"
-    # cluster ingress: Rancher, Keycloak, tenant app wildcard
+      need: "{{ [hpc_registry_system_host, hpc_registry_user_host, hpc_admin_host ~ '.' ~ hpc_domain] | join(',') }}"
+    # the registries' loopback push endpoints on the admin node; always internal
+    - name: local
+      sans: localhost,127.0.0.1
+    # cluster ingress: Rancher, Keycloak (and the ingress default certificate)
     - name: ingress
       sans: "{{ [hpc_rancher_host, hpc_keycloak_host, '*.' ~ hpc_apps_domain] | join(',') }}"
+      need: "{{ [hpc_rancher_host, hpc_keycloak_host] | join(',') }}"
   loop_control:
     loop_var: cert
+    label: "{{ cert.name }}"
 
 - name: Generated credentials exist
   ansible.builtin.set_fact:

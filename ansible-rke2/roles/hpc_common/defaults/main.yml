@@ -266,7 +266,9 @@ hpc_charts_rancher_repo: hpc-local    # ClusterRepo name in Rancher (Apps)
 # Trivy operator (docs/trivy.md): reports only, enforces nothing
 # =============================================================================
 hpc_trivy_namespace: trivy-system
-hpc_trivy_java_db: false          # also bundle the Java vulnerability DB (about 1 GB); without it JARs are not checked
+# The Java vulnerability DB (about 1 GB in the bundle). Without it Trivy cannot
+# scan any image that contains JAR files (Keycloak, ...): their scans fail.
+hpc_trivy_java_db: true
 hpc_trivy_db_refresh: false       # -e hpc_trivy_db_refresh=true: download today's vulnerability DB and publish it
 hpc_trivy_target_namespaces: ""   # comma-separated; '' = every namespace
 hpc_trivy_exclude_namespaces: ""  # comma-separated glob patterns

@@ -116,3 +116,49 @@ Found on the way:
   secret, and Rancher's secret (updated later, by the rancher role) still
   covered both names. The platform role now updates Rancher's and
   Keycloak's ingress secrets together.
+
+## Process improvements, charts, upstream IdP, Trivy, Harvester (2026-11-25)
+
+Started from the lab as the 2026-11-24 tests left it. Lab settings added in
+`inventories/lab/group_vars/all.yml`: `hpc_agent_batch: 1`,
+`hpc_enable_trivy`, `hpc_enable_harvester` (UI extension only),
+`hpc_upstream_oidc_spoof`.
+
+| Step | Result |
+|------|--------|
+| `CHECK_UVX=1 ./check.sh inventories/lab/hosts.yml` | syntax of 7 playbooks, flat file, 11 scripts, 6 Python files, yamllint, ansible-lint, shellcheck: all passed |
+| `site.yml --check --diff` on the deployed cluster | 88 s, no failure; predicted exactly the new nginx locations and chart values |
+| `bundle.yml` | charts (5, incl. trivy-operator and the Harvester extension), `rke2-images-harvester`, Trivy images and DBs, extension files fetched and pushed |
+| `site.yml` | chart repository indexed and served, Rancher catalog `hpc-local` Downloaded, Trivy operator, Harvester extension `cached` by Rancher from the admin node, upstream IdP |
+| `site.yml` again | 107 s; 0 changes on compute nodes; Helm revisions of Rancher, NFS, CephFS, Trivy, Harvester unchanged (before: every run made a new Rancher revision; it had reached 17) |
+| `verify.yml` | **126 checks passed** (108 before + 18 new: chart repository, upstream login linked / stranger refused, Trivy reports offline, Harvester extension) |
+| node label change on the agents with `hpc_agent_batch: 1` | c1, c2, c3 restarted one after another (about 21 s apart, each waiting for its kubelet) |
+| c3 unreachable (fake address), `--check -e hpc_compute_max_failed=0` | listed as not deployed; run stopped after the RKE2 stage |
+| same with the default (`-1`) | run went to the end on a1, c1, c2; run log `finished=3/4 not_finished=c3` |
+| `site.yml --limit c3` | c3's `/etc/hosts` still lists every node; nothing changed; run log `limit=c3 finished=1/1` |
+| upstream IdP from a saved flat file (the simulated realm's endpoints) | configured from the file; editing an endpoint in the file updated Keycloak, restoring it updated it back; verify passed with it (broker login) |
+| file whose issuer differs from `hpc_upstream_oidc_issuer` | stopped with "is for issuer ..., but hpc_upstream_oidc_issuer is ..." |
+| `hpc_upstream_oidc_discovery_url` (good / 404) | configured / warning, then a clear error naming the URL |
+| `-e hpc_trivy_db_refresh=true` | DB fetched again; unchanged upstream, so not re-published; after overwriting `trivy-db:2` in the registry with another image, the refresh re-published the real DB |
+
+Found on the way:
+
+- Rancher's `ClusterRepo.spec.caBundle` wants one DER certificate; a PEM
+  bundle gives "x509: malformed certificate". Rancher now trusts the site CA
+  itself (`additionalTrustedCAs`), and the catalog needs no `caBundle`.
+- The Trivy chart's `sslCertDir` reaches only the scan container, not the
+  init containers that log in to the registry and download the DB, and it
+  is a host path that SELinux does not let containers read. The CA bundle
+  is now a ConfigMap mounted over the image's default CA file.
+- Scan jobs run one Trivy per container over one on-disk cache. Pods with
+  several containers failed with "cache may be in use by another process";
+  the scan cache is now in memory.
+- Images with JAR files (Keycloak) cannot be scanned without the Java DB at
+  all, so the Java DB is bundled by default.
+- The Trivy operator reads its settings only at start: the role restarts it
+  when they change.
+- A compute node that does not answer used to stop the whole run at
+  `/etc/hosts` on every other node, and the CephFS kernel-module probe (run
+  from the admin node against every node) stopped the admin node. Both now
+  carry on.
+- Rancher shows UI extensions only to logged-in users; the check logs in.

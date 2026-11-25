@@ -49,6 +49,7 @@
   loop: "{{ hpc_cluster_hosts | difference(ansible_play_hosts_all) }}"
   run_once: true
   check_mode: false
+  ignore_unreachable: true   # its address then comes from the inventory (below)
 
 - name: Their addresses
   ansible.builtin.set_fact:
@@ -63,6 +64,32 @@
   delegate_to: "{{ item }}"
   delegate_facts: true
   loop: "{{ hpc_cluster_hosts | difference(ansible_play_hosts_all) }}"
+  run_once: true
+
+# A node that is down or unreachable drops out of the run, but the others
+# still list it (/etc/hosts, NFS exports). Its address then comes from the
+# inventory: ansible_host, when that is an IPv4 address (the management address).
+- name: Addresses of cluster nodes that did not answer (from the inventory)
+  ansible.builtin.set_fact:
+    hpc_mgmt_ip: "{{ hostvars[item].ansible_host }}"
+  delegate_to: "{{ item }}"
+  delegate_facts: true
+  loop: "{{ hpc_cluster_hosts | difference(ansible_play_hosts) }}"
+  when:
+    - hostvars[item].hpc_mgmt_ip is not defined
+    - (hostvars[item].ansible_host | default('')) is match('^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+  run_once: true
+
+- name: Cluster nodes without a known address
+  ansible.builtin.assert:
+    that: _unknown | length == 0
+    fail_msg: >-
+      {{ _unknown | join(', ') }} did not answer and the inventory gives no IPv4 ansible_host for
+      {{ 'it' if _unknown | length == 1 else 'them' }}; the other nodes cannot list them.
+      Set hpc_mgmt_ip in their host_vars, or remove them from the inventory.
+  vars:
+    _unknown: "{{ hpc_cluster_hosts | reject('in', hpc_cluster_hosts | map('extract', hostvars) | selectattr('hpc_mgmt_ip', 'defined')
+                  | map(attribute='inventory_hostname') | list) | list }}"
   run_once: true
 
 - name: Networks

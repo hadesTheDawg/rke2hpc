@@ -48,7 +48,8 @@
         cmd: |
           set -euo pipefail
           d={{ hpc_data_root }}/charts
-          out=$(rsync -rt --delete --itemize-changes --exclude=/index.yaml {{ hpc_data_root }}/bundle/charts/ "$d/")
+          # file changes only: writing index.yaml touches the directory's own time
+          out=$(rsync -rt --delete --itemize-changes --exclude=/index.yaml {{ hpc_data_root }}/bundle/charts/ "$d/" | grep -v '^\.d' || true)
           if [ -n "$out" ] || [ ! -s "$d/index.yaml" ] || ! grep -qF "{{ hpc_charts_url }}/" "$d/index.yaml"; then
             {{ hpc_data_root }}/bundle/bin/helm repo index "$d" --url "{{ hpc_charts_url }}"
             restorecon -R "$d"

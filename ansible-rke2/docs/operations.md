@@ -81,13 +81,22 @@ hpc_compute_max_failed: 0    # any failed compute node stops the run after RKE2
 
 Fix the node and re-run (or `--limit <node>`).
 
+A node that is down is still listed by the others (`/etc/hosts`, NFS
+exports) with the address from the inventory's `ansible_host`, when that is
+an IPv4 address. Otherwise set `hpc_mgmt_ip` in its `host_vars`, or the run
+stops in preflight and names it. Tasks that reach every node from the admin
+node (the CephFS kernel-module probe) skip a node that is down instead of
+failing the admin node.
+
 ## `--limit`
 
 `site.yml --limit c001` deploys one node. The nodes outside the limit still
 appear in `/etc/hosts`, NFS export lists and the cluster checks, so preflight
-reads their facts and addresses too (delegated fact gathering). A limited run
-needs ssh to every cluster node, but changes only the limited ones. To
-re-provision a node, `--limit <node>` is enough.
+reads their facts and addresses too (delegated fact gathering; one that does
+not answer gets its address from the inventory, as below). A limited run
+changes only the limited nodes. After a node was re-provisioned,
+`--limit <node>` is enough. The PKI play on the deployer is skipped under a
+limit that leaves out `localhost`; that is fine unless certificates changed.
 
 ## Logs
 

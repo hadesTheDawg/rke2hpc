@@ -68,6 +68,10 @@ if [ "$TRIVY_ENABLED" = true ]; then
   for _ in $(seq 30); do kc_report >/dev/null 2>&1 && break; sleep 10; done
   t  "Keycloak's image has a vulnerability report" kc_report
   t  "configuration audit reports exist" sh -c "[ \$($KUBECTL get configauditreports -A --no-headers 2>/dev/null | wc -l) -gt 0 ]"
+  nsa=$($KUBECTL get ns -l "hpc.io/project=$GROUP_A" -o jsonpath='{.items[0].metadata.name}')
+  can() { $KUBECTL auth can-i list vulnerabilityreports.aquasecurity.github.io -n "$1" --as verify-probe --as-group "$OIDC_GROUP_PREFIX$GROUP_A"; }
+  t  "project $GROUP_A can read the reports of its namespace" can "$nsa"
+  tn "project $GROUP_A cannot read kube-system's reports" can kube-system
   t  "it reports only: no admission webhook" sh -c "! $KUBECTL get validatingwebhookconfigurations,mutatingwebhookconfigurations -o name | grep -qi trivy"
 fi
 
@@ -75,7 +79,9 @@ fi
 if [ "$HARVESTER_UI" = true ]; then
   t  "Harvester UI extension served by the admin node" curl -fsS -o /dev/null "$HARVESTER_UI_URL/$HARVESTER_UI_VERSION.tgz"
   t  "Rancher fetched and cached it" test "$($KUBECTL -n cattle-ui-plugin-system get uiplugin harvester -o jsonpath='{.status.cacheState}')" = cached
-  t  "Rancher serves it to browsers" curl -fsS -o /dev/null \
+  # Rancher lists extensions only to logged-in users (unless noAuth): as the platform admin.
+  rtok=$(OIDC_PASSWORD="$ADMIN_PW" python3 "$VERIFY_DIR/rancher-oidc-login.py" "https://$RANCHER_HOST" "$ADMIN_USER" 2>/dev/null || true)
+  t  "Rancher serves it to logged-in browsers" curl -fsS -o /dev/null -H "Authorization: Bearer $rtok" \
      "https://$RANCHER_HOST/v1/uiplugins/harvester/$HARVESTER_UI_VERSION/plugin/harvester-$HARVESTER_UI_VERSION.umd.min.js"
 fi
 summary

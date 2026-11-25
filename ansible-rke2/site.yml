@@ -150,37 +150,37 @@
     - {role: harvester, when: hpc_enable_harvester | bool, tags: [harvester]}
 
 # One line per run in hpc_run_log (inventories/<site>/logs/runs.log); the full
-# output of every run is in .logs/ansible.log (ansible.cfg).
-- name: Nodes that finished the run
-  hosts: rke2_servers:rke2_agents
-  gather_facts: false
-  become: false
-  tags: [always]
-  tasks:
-    - name: Finished
-      ansible.builtin.set_fact:
-        _hpc_finished: true
-
+# output of every run is in .logs/ansible.log (ansible.cfg). Written from the
+# cluster nodes (delegated to the deployer), so --limit <node> runs log too.
 - name: Run record
-  hosts: localhost
-  connection: local
+  hosts: rke2_servers:rke2_agents
   gather_facts: false
   become: false
   tags: [always]
   roles: [hpc_common]
   tasks:
+    - name: Finished
+      ansible.builtin.set_fact:
+        _hpc_finished: true
+
     - name: Log directory
       ansible.builtin.file:
         path: "{{ hpc_run_log | dirname }}"
         state: directory
         mode: "0700"
       check_mode: false
+      delegate_to: localhost
+      run_once: true
+
     - name: Deployment revision
       ansible.builtin.command: git -C "{{ playbook_dir }}" describe --always --dirty
       register: _rev
       changed_when: false
       failed_when: false
       check_mode: false
+      delegate_to: localhost
+      run_once: true
+
     - name: Append to the run log
       ansible.builtin.shell:
         cmd: printf '%s\n' "$LINE" >> "{{ hpc_run_log }}"
@@ -199,6 +199,8 @@
       vars:
         _tgt: "{{ query('ansible.builtin.inventory_hostnames', ansible_limit | default('rke2_servers:rke2_agents', true))
                   | select('in', hpc_cluster_hosts) | list }}"
-        _fin: "{{ _tgt | map('extract', hostvars) | selectattr('_hpc_finished', 'defined') | map(attribute='inventory_hostname') | list }}"
+        _fin: "{{ ansible_play_hosts }}"
       changed_when: false
       check_mode: false
+      delegate_to: localhost
+      run_once: true

@@ -403,7 +403,11 @@ def configure_upstream(kc, inp):
         if status != 200 or not isinstance(doc, dict):
             log("upstream: %s not readable from the admin node (HTTP %s); Keycloak fetches it itself" % (url, status))
             doc = {}
-        conf = kc.call("POST", base + "/import-config", {"providerId": "oidc", "fromUrl": url})[1]
+        status, conf, _ = kc.call("POST", base + "/import-config", {"providerId": "oidc", "fromUrl": url}, ok=None)
+        if status != 200 or not isinstance(conf, dict):
+            die("Keycloak could not read the upstream OpenID configuration at %s (HTTP %s). Check the URL, "
+                "that Keycloak's pods reach it and trust its certificate, or use hpc_upstream_oidc_config_file"
+                % (url, status))
         source = url
     if issuer and conf.get("issuer") and conf["issuer"].rstrip("/") != issuer.rstrip("/"):
         die("upstream issuer is %s, but hpc_upstream_oidc_issuer says %s" % (conf["issuer"], issuer))

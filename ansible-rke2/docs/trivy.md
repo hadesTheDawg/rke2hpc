@@ -32,7 +32,7 @@ be switched on later without a new download:
 | scanner image `aquasec/trivy:<hpc_trivy_version>` | `registry.<domain>:5000/aquasec/trivy` |
 | `aquasecurity/node-collector` | (unused, see below) |
 | vulnerability DB `aquasec/trivy-db:2` (about 140 MB) | `registry.<domain>:5000/aquasec/trivy-db:2` |
-| Java DB `aquasec/trivy-java-db:1` (about 1 GB), only with `hpc_trivy_java_db: true` | `registry.<domain>:5000/aquasec/trivy-java-db:1` |
+| Java DB `aquasec/trivy-java-db:1` (about 1 GB), with `hpc_trivy_java_db` (default `true`) | `registry.<domain>:5000/aquasec/trivy-java-db:1` |
 
 The scanners run with `offlineScan` and with the built-in policies. They pull
 the images they scan **themselves**, not through containerd, so the role gives
@@ -44,7 +44,7 @@ them what the nodes have in `registries.yaml`:
 - the system registry's read-only `pull` account (in the operator's
   `trivy-operator-trivy-config` ConfigMap and Secret, readable by cluster
   administrators only, the same account every node already has);
-- the CA bundle, mounted at `/etc/hpc-ca` (`SSL_CERT_DIR`).
+- the CA bundle: the admin node's `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem` (system CAs plus the site bundle) as ConfigMap `hpc-ca-bundle`, mounted over `/etc/ssl/certs/ca-certificates.crt` in every scan-job container. The chart's `sslCertDir` is not used, for two reasons: the operator passes it only to the scan container, not to the init containers that log in and download the DB; and it is a host directory, which SELinux does not let containers read.
 
 ## Keeping the vulnerability DB current
 
@@ -76,7 +76,7 @@ Monthly or after a major advisory is a sensible rhythm for an offline site.
 | `hpc_trivy_severity` | `UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL` | severities kept in reports |
 | `hpc_trivy_concurrent_scans` | `2` | scan jobs at a time (on the admin node) |
 | `hpc_trivy_report_ttl` | `24h` | a report is redone after this |
-| `hpc_trivy_java_db` | `false` | bundle and use the Java DB (checks JARs) |
+| `hpc_trivy_java_db` | `true` | bundle and use the Java DB. With `false` the bundle is about 1 GB smaller, but every image that contains JAR files (Keycloak, for one) fails to scan: Trivy will not skip the Java DB on a first run |
 | `hpc_trivy_db_refresh` | `false` | `-e` only: bring today's DB (above) |
 | `hpc_trivy_extra_values` | `{}` | merged into the chart values (`roles/trivy/templates/values.yaml.j2`) |
 | `hpc_trivy_*_version`, `hpc_trivy_operator_chart_version` | | in `roles/hpc_common/defaults/main.yml`; bump them, then build a new bundle |
@@ -105,12 +105,19 @@ $k get clustercompliancereports                  # k8s-nsa-1.0, k8s-pss-baseline
 ```
 
 Rancher shows the same objects under *More Resources > aquasecurity.github.io*.
-Project members can read the reports of their own namespaces (the chart
-aggregates read access into the built-in `view` role).
+Project members can read the reports of their own namespaces and of no
+others: the chart aggregates read access into the built-in `view`, `edit` and
+`admin` roles, and project groups have `edit` in their namespaces.
 
 verify.yml checks that the operator runs from the internal registry, that
 reports appear (so images and the DB were pulled offline), that Keycloak's
-image has a vulnerability report, and that no admission webhook exists.
+image (a Java image) has a vulnerability report, that a project can read
+its own reports and not kube-system's, and that no admission webhook exists.
+
+After a failed scan (for example before the DB was in the registry), the
+operator does not always come back to that workload by itself. The role
+restarts it whenever its settings change; by hand:
+`kubectl -n trivy-system rollout restart deploy/trivy-operator`.
 
 ## Enforcement (not done)
 

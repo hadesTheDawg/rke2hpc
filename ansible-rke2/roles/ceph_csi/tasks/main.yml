@@ -11,6 +11,7 @@
   delegate_to: "{{ item }}"
   loop: "{{ hpc_cluster_hosts }}"
   become: true
+  ignore_unreachable: true   # a node that is down must not stop the admin node's run
 
 - name: Kernel client warning
   ansible.builtin.debug:
@@ -20,7 +21,7 @@
   loop: "{{ _mod.results }}"
   loop_control:
     label: "{{ item.item }}"
-  when: item.rc != 0
+  when: not (item.unreachable | default(false)) and item.rc | default(0) != 0
 
 - name: Admin tools
   ansible.builtin.include_role:

@@ -1,5 +1,12 @@
 # managed by ansible (hpc trivy). Chart: trivy-operator {{ hpc_trivy_operator_chart_version }}
-{# same mirrors as the nodes' registries.yaml: scanners pull images themselves #}
+{# same mirrors as the nodes' registries.yaml: scanners pull images themselves.
+   CA trust: ConfigMap hpc-ca-bundle (the site trust bundle, trivy role) is
+   mounted over the image's default CA file in every scan-job container.
+   Not sslCertDir: the operator sets SSL_CERT_DIR only in the scan container,
+   not in the init containers that log in and download the DB; and it mounts
+   a host directory, which SELinux does not let containers read.
+   cache.backend memory: a scan job runs one trivy per container over one
+   cache directory; the on-disk cache's lock makes all but one of them fail. #}
 {% set _registries = {
      'index.docker.io': [hpc_usrreg, hpc_sysreg],
      'quay.io': [hpc_sysreg],
@@ -22,14 +29,14 @@
     'infraAssessmentScannerEnabled': false,
   },
   'trivyOperator': {
-    'scanJobCustomVolumes': [{'name': 'hpc-ca', 'configMap': {'name': 'hpc-ca'}}],
-    'scanJobCustomVolumesMount': [{'name': 'hpc-ca', 'mountPath': '/etc/hpc-ca', 'readOnly': true}],
+    'scanJobCustomVolumes': [{'name': 'hpc-ca-bundle', 'configMap': {'name': 'hpc-ca-bundle'}}],
+    'scanJobCustomVolumesMount': [{'name': 'hpc-ca-bundle', 'mountPath': '/etc/ssl/certs/ca-certificates.crt',
+                                   'subPath': 'ca-certificates.crt', 'readOnly': true}],
   },
   'trivy': {
     'mode': 'Standalone',
     'command': 'image',
     'severity': hpc_trivy_severity,
-    'sslCertDir': '/etc/hpc-ca',
     'dbRegistry': hpc_sysreg,
     'dbRepository': 'aquasec/trivy-db',
     'javaDbRegistry': hpc_sysreg,
@@ -41,6 +48,7 @@
     'useBuiltinRegoPolicies': 'false',
     'useEmbeddedRegoPolicies': 'true',
     'resources': {'requests': {'cpu': '100m', 'memory': '256M'}, 'limits': {'cpu': '1', 'memory': '2Gi'}},
-    'configFile': {'registry': {'mirrors': _registries, 'username': ['pull'], 'password': [hpc_registry_pull_password]}},
+    'configFile': {'registry': {'mirrors': _registries, 'username': ['pull'], 'password': [hpc_registry_pull_password]},
+                   'cache': {'backend': 'memory'}},
   },
 } | combine(hpc_trivy_extra_values, recursive=true)) | to_nice_yaml(indent=2) }}

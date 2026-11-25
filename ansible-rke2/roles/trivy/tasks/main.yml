@@ -20,13 +20,15 @@
     name: hpc_common
     tasks_from: pin-namespaces
 
-# Scanners pull images themselves (not through containerd), so they get the
-# CA bundle mounted (/etc/hpc-ca) to trust the internal registries.
+# Scanners pull images themselves (not through containerd). They trust the
+# internal registries through this bundle, mounted into every scan-job
+# container (values.yaml.j2).
 - name: Trusted CAs for the scan jobs
   ansible.builtin.shell:
     cmd: >-
       set -o pipefail;
-      {{ hpc_kubectl }} -n {{ hpc_trivy_namespace }} create configmap hpc-ca --from-file=ca.crt=/etc/pki/hpc/ca.crt
+      {{ hpc_kubectl }} -n {{ hpc_trivy_namespace }} create configmap hpc-ca-bundle
+      --from-file=ca-certificates.crt=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
       --dry-run=client -o yaml | {{ hpc_kubectl }} apply -f -
   register: _ca
   changed_when: "'configured' in _ca.stdout or 'created' in _ca.stdout"
@@ -49,6 +51,19 @@
       - 10m
   register: _trel
   changed_when: "'deployed' in _trel.stdout"
+
+# The operator reads its ConfigMaps only at start; scan jobs created from the
+# old settings are dropped so they are redone with the new ones.
+- name: Restart the operator with the new settings
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      k="{{ hpc_kubectl }} -n {{ hpc_trivy_namespace }}"
+      $k rollout restart deploy/trivy-operator
+      $k rollout status deploy/trivy-operator --timeout=300s
+      $k delete jobs -l app.kubernetes.io/managed-by=trivy-operator --ignore-not-found --wait=false
+  when: (_trel is changed and 'revision 1' not in _trel.stdout) or _ca is changed
+  changed_when: true
 
 # A new vulnerability DB in the registry (hpc_trivy_db_refresh) is picked up by
 # the next scans; rescan everything now instead of waiting for the report TTL.
